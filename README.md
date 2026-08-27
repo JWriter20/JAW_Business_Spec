@@ -99,7 +99,7 @@ cursor" means, and what a checker compares against:
 
 ```jsonc
 "cursor": {
-  "requestedSince": "2026-08-26T17:04:03.114Z",  // echoed, or null on a first call
+  "requestedSince": "2026-08-26T17:04:03.114Z",  // the parsed since, or null on a first call
   "from": "2026-08-26T17:04:03.114Z",            // start of what this response covers
   "streams": {
     "events": "2026-08-26T18:03:58.902Z",
@@ -118,6 +118,10 @@ the next request. It never invents a watermark from its own clock.
 `from` is where coverage begins: the requested cursor, or the backfill start on a
 first call. Without it a first response cannot say whether it carried 24 hours or
 20 minutes.
+
+`requestedSince` is the instant the producer **parsed**, not the query string it
+arrived in. Echoing the raw parameter reflects caller-controlled text into a
+document that something else renders (§27, rule 11). Parse it, or return null.
 
 ### Rules
 
@@ -1455,6 +1459,13 @@ metric so it graphs.
 last-good values on. To name one missing number rather than a whole section, add
 `metric`.
 
+**`reason` is written for a human, never pasted from an exception.** "billing API
+returned 502" is the whole of it. A caught exception carries internal hostnames,
+connection strings, and stack frames straight into a document §27 promises holds
+none of those, and this field is filled in at exactly the moment somebody is
+reaching for the nearest string. The discipline §18 applies to an error message
+applies here.
+
 Present means the report is incomplete and says which part. The consumer shows a
 banner and keeps the last good value for those sections, marked stale. A
 dropped buffer (§2) is declared here too.
@@ -1491,6 +1502,10 @@ dropped buffer (§2) is declared here too.
 Sort before you truncate. Send the 100 error buckets that matter, not the 100
 the query returned first.
 
+**The 2 MB cap is on the decompressed document, and has to be enforced while
+decompressing.** §1 compresses the body, so a consumer that checks the size after
+decompressing has already allocated whatever it was handed (§27, rule 12).
+
 Streams truncate with a watermark (§2, rule 4) and are therefore never lossy —
 except `errors`, which is ranked by `count` and drops its tail. Snapshots
 truncate by dropping the least important rows, and are lossy by design.
@@ -1500,8 +1515,15 @@ truncate by dropping the least important rows, and are lossy by design.
 ## 27. Security
 
 This document is a complete operational picture of a company behind one bearer
-token, fetched by a machine that holds the same for every other company. Two
-controls, in this order: who may connect, then who may read.
+token, fetched by a machine that holds the same for every other company. Both
+halves of that sentence are a threat model, and the second one is the half that
+gets forgotten: the endpoint faces whoever finds it, and the consumer faces
+every business it polls. A dashboard showing forty companies is a better target
+than any one of them.
+
+### Serving it
+
+Two controls on the way in, in this order: who may connect, then who may read.
 
 1. **Allowlist the caller, and check it before the token.** The endpoint accepts
    connections only from an explicit list of addresses, CIDR ranges, and
@@ -1528,6 +1550,12 @@ controls, in this order: who may connect, then who may read.
    - **Log every denial with its source address.** A denial from an address you do
      not recognise is the only place this document will ever tell you that
      somebody found the endpoint.
+   - **Log the authentication failures too.** A `403` is somebody who found the
+     endpoint. A `401` — an on-list address presenting the wrong token — is
+     somebody already inside the network the allowlist trusts, and that is the
+     worse of the two to receive and the easier of the two to miss. Log both with
+     their source address, and alert on a run of `401`s; nobody reads the log
+     until after.
 
 2. **Bearer token, always.** `Authorization: Bearer <token>`, minimum 32
    characters, compared in constant time. Never in the query string, never in a
@@ -1536,23 +1564,93 @@ controls, in this order: who may connect, then who may read.
    allowlist, means deny every request — never "skip the check". That is the bug
    that ships inside a container whose env file did not mount and looks healthy
    while wide open.
-4. **One token per business**, rotatable without coordinating across companies,
-   and separate from any credential that can spend money or write.
-5. **TLS, or a tunnel.** Bearer tokens go over HTTPS. The one exception is a
+4. **Accept a set of tokens, or nobody ever rotates.** Rotation is three steps —
+   add the new token, move the consumer to it, drop the old one — and it needs a
+   window where both are valid. Swapping one env var and restarting races the
+   consumer's next poll into a `401` that §1 tells it not to retry through, so
+   the one-minute rotation takes the dashboard down, and after that it is never
+   done again. One token per business, never shared across companies, each
+   separate from any credential that can spend money or write. Give them a max
+   age and record when each was issued: a bearer token with no expiry is a
+   permanent credential whose provenance everybody has forgotten.
+5. **Machine to machine. Send no CORS headers.** No `Access-Control-Allow-Origin`,
+   no cookie or session auth, ever. A browser that can call this endpoint
+   directly is a browser holding the bearer token in JavaScript, where one XSS
+   anywhere on that origin — or one open devtools panel — takes it, and the token
+   is worth every other section of this document. A browser dashboard is a fine
+   thing to build: it calls its own server, and that server holds the token and
+   owns the allowlisted address.
+6. **TLS, or a tunnel.** Bearer tokens go over HTTPS. The one exception is a
    listener bound to loopback and reached through SSH or a VPN, where the tunnel
    is the transport security. Never a plaintext port on a public interface.
-6. **No secrets, no bodies, no PII.** No keys, tokens, passwords, connection
+7. **No secrets, no bodies, no PII.** No keys, tokens, passwords, connection
    strings, customer documents, or message bodies. No account, routing, or card
    numbers, and no transaction lists — §11 is balances and totals, and the
    connection behind it is read-only. Mask email addresses, and see §19 for what
    an inbox section does still carry and what that costs. Error samples carry
-   identifiers, not payloads. Private repository issues stay out.
+   identifiers, not payloads. Free-text `reason` and `note` strings are written,
+   not pasted from an exception (§25). Private repository issues stay out.
    The report is cached, logged, and stored on another machine; a backup of that
    machine is a backup of everything you ever put in a report.
-7. **`Cache-Control: no-store`.**
-8. **Rate limit** to roughly 10/min, with `Retry-After` on every `429`. The
+8. **`Cache-Control: no-store`.**
+9. **Rate limit** to roughly 10/min, with `Retry-After` on every `429`. The
    consumer polls once a minute, plus a few immediate re-polls to drain a
    truncated stream (§2, rule 4); more than that is a bug or an intruder.
+
+### Assembling it
+
+10. **Every upstream credential is read-only, and scoped to what it reads.** §11
+    says this for the money already — a monitoring endpoint has no reason to hold
+    a credential that can move money — and the reasoning does not stop at banks.
+    This report is assembled from billing APIs, cloud consoles, error trackers,
+    repositories, CI, mail, and registrars, and the process holding every one of
+    those tokens at once is the process you have deliberately put on a network
+    port.
+
+    A billing *read* role, not the account root. A repository token that lists
+    issues and cannot push. One credential per upstream, so one leak is one
+    system. Nothing that can deploy, delete, transfer a domain, charge a card, or
+    write a row.
+
+    The blast radius of compromising the reporter should be *it reads a report*.
+    Past that, the monitoring you added to sleep better is the softest way into
+    the company, and it is pointed at everything by design.
+
+### Consuming it
+
+11. **The report is untrusted input, from every business, always.** A conforming
+    document is not a safe one. The producer chooses every string and every URL
+    in it, and the consumer renders those next to thirty-nine other companies
+    while holding all forty bearer tokens. One compromised producer must not
+    reach the others.
+
+    - **Escape on render.** Every text field — `label`, `title`, `summary`,
+      `note`, `message`, `snippet`, `name` — is displayed as text, never as
+      markup. `extra` (§25) is arbitrary JSON rendered generically, so its keys
+      get the same treatment as its values.
+    - **Allow `http` and `https` in URLs, and nothing else.** Every `url`,
+      `accountUrl`, and `links[].url` is producer-controlled by definition;
+      `javascript:`, `data:`, and `vbscript:` are inert text or dropped. Link out
+      with `rel="noopener noreferrer"`.
+    - **Ids are join keys, so handle them as data.** They reach a database and a
+      URL path. Parameterize the query, encode the segment. §3's 128 printable
+      ASCII characters are a shape to enforce on arrival, not a promise to trust.
+    - **Never execute anything out of the document, and never fetch a URL from it
+      server-side.** A dashboard that health-checks producer-supplied URLs from
+      its own network is an SSRF engine that somebody else configures.
+
+12. **Bound the body before parsing it.** §26's 2 MB cap is on the *decompressed*
+    document and §1 compresses the body, so a consumer that measures after
+    decompressing has already allocated whatever it was sent. Cap the decompressed
+    stream and abort mid-decompression when it is passed, bound nesting depth, and
+    time the read out. `extra` is arbitrary JSON, so depth is not theoretical.
+
+13. **The token store is worth more than any endpoint it polls.** One credential
+    per business, in one place. Encrypted at rest, never in a log line, an argv,
+    or a crash dump. Do not log response bodies — the report is the thing every
+    producer was promised you would not spread — and remember that snapshots
+    inherit all of it: §19's inbox is customer-written text, so a backup of the
+    dashboard is a backup of every report it has ever stored.
 
 ---
 
@@ -1582,7 +1680,9 @@ shapes, money integral, ratios in 0–1 unless `signed`, `unitLabel` set wheneve
 `unit` is `other`, `window` set on counters and drawn from §6.4, `cohort` present
 on every cohort-basis funnel stage, balance present on `prepaid` and `quota`
 vendors, absent on `postpaid`, and optional on `free` (§10), `usdCents` present
-on every account not denominated in `usd`. *Errors.*
+on every account not denominated in `usd`, and every `url`, `accountUrl`, and
+`links[].url` an `http` or `https` URL and nothing else (§27, rule 11).
+*Errors.*
 
 **2. Consistent.** The document agrees with itself:
 
@@ -1648,12 +1748,23 @@ either has a host, inherits one, declares `serverless`, or is `kind: external`.
   unset, every request gets `403`. Starting up with the dynamic-DNS hostname
   unresolvable leaves the endpoint closed, not open.
 - Served over HTTPS, or over a loopback listener reached through a tunnel.
+- **No CORS.** No `Access-Control-Allow-Origin` on any response, including the
+  `401` and the `403`. A preflight `OPTIONS` is not answered permissively.
+- **Rotation overlap.** With a second token configured, both the outgoing and the
+  incoming token return `200`. A deployment that accepts only one token cannot be
+  rotated without an outage, so it will not be rotated (§27, rule 4).
 - **Cursor round trip:** call once, send `cursor.streams` back immediately, and
   confirm the watermarks come back equal or later and no `events`, `inbox`, or
   `ci` item repeats. `errors` and `issues` may legitimately return the same id
   again, so compare `(id, lastSeenAt)` and `(id, updatedAt)` there (rule 3). It
   catches the race in §2: a producer stamping watermarks from a single "now"
   fails it.
+
+**Passes 1–4 check a producer.** The consumer is the other half of §27 and needs
+its own fixtures: a report carrying a `javascript:` URL, a `note` full of markup,
+an id with a quote in it, and a body that decompresses past 2 MB. Each must be
+rendered inert, stored safely, or rejected — never trusted because the schema
+validated. A conforming document is not a safe one.
 
 Exit non-zero on errors, zero on warnings alone. Run passes 1–3 against a fixture
 in each business's CI — a refactor that drops a metric should fail a pull request,
