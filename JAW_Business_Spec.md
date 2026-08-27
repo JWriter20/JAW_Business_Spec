@@ -17,10 +17,9 @@ Four rules the rest of this document follows from:
    the business does.
 
 The goal is a document rich enough that a dashboard — or a local model reading
-it every minute — can tell that something is wrong: spend climbing, a cron that
-processed 212,000 rows instead of 20,000, memory creeping up in one service,
-a domain expiring, an LLC filing overdue, a GPU thermal-throttling, support mail
-piling up.
+it every minute — can tell something is wrong: spend climbing, a cron that
+processed 212,000 rows instead of 20,000, memory creeping in one service, a
+domain expiring, a filing overdue, a GPU throttling, support mail piling up.
 
 **Status:** v1. **License:** Apache-2.0.
 
@@ -45,8 +44,8 @@ Returns `200 application/json` with a Business Report.
 | `cursor` | URL-encoded JSON: the `cursor.streams` object from the previous response. Per-stream watermarks. Wins over `since` for any stream it names. |
 | `sections` | Comma-separated top-level keys to return. Optional; a business may ignore it. |
 
-`since` and `cursor` are the whole request contract. Everything else about what
-to collect is the business's decision.
+`since` and `cursor` are the whole request contract; what to collect is the
+business's decision.
 
 No `since` and no `cursor` means a first call: return current state plus a
 bounded backfill for the streams — 24 hours by default — and report the
@@ -283,9 +282,9 @@ Unscoped means business-wide. `revenue.net` with no scope is the company's;
 `revenue.net` with `service: "api"` is that product line's.
 
 **Identity is the whole tuple**: `id` + `service` + `host` + `vendor` + `job` +
-`endpoint` + `api` + `instance` + `outcome`. That tuple must be unique in the document.
-Everything else — which services are busy, which are idle, which earns money,
-which leaks memory — is a group-by on the consumer's side.
+`endpoint` + `api` + `instance` + `outcome`, and it must be unique in the
+document. Everything else — which services are busy, which are idle, which earn
+money, which leak memory — is a group-by on the consumer's side.
 
 ### 6.2 Registry
 
@@ -516,9 +515,6 @@ Rules:
 - **A child inherits `hosts` and `serverless` from its parent** unless it sets
   its own. Four workers in one process do not each repeat the machine.
 
-Sub-services are how "which parts are used a lot and which are dead weight"
-becomes a sort, and how a failure lands on Source B rather than on ingest.
-
 ---
 
 ## 8. `vendors` — what we pay for
@@ -573,9 +569,9 @@ rolls. This is the section that answers "are expenditures getting out of hand".
 | `postpaid` | must be null | Nothing to run out of; spend accrues. Something that can hit zero is not postpaid. |
 | `free` | optional | No money, but a free tier still has a ceiling worth watching. `spend` must be zero or absent. |
 
-`usage.used` and `usage.included` are legal on any billing mode — metering and a
-plan allowance are not a balance. `usage.remaining` is the balance, and it is
-the field the table above constrains.
+`usage.remaining` is the balance the table constrains. `usage.used` and
+`usage.included` are legal on any billing mode — metering and a plan allowance
+are not a balance.
 
 Ranking accounts by "days until zero" only works if the ones that never reset
 are distinguishable from the ones that do.
@@ -592,11 +588,10 @@ what is running, not for bookkeeping. A producer that wants them anyway puts
 them in `spend.lastInvoiceCents` for the period they hit and says so in `note`.
 
 **`parent` breaks a bill into line items, and you should break it.** One
-provider with compute, functions, storage, a managed database, and egress is six
-entries: the account, and five children. A lump per provider tells you spend went
-up. Line items tell you which component did it, which is the only version of that
-fact anyone can act on — and every billing API worth using will group by
-component if you ask it to.
+provider with compute, functions, storage, a database, and egress is six
+entries: the account and five children. A lump per provider says spend went up;
+line items say which component did it, which is the only version you can act on.
+Billing APIs will group by component if you ask.
 
 A parent's `spend` is the whole account. Children sum to no more than the parent;
 the gap is spend the provider did not attribute.
@@ -630,14 +625,12 @@ what a stale `lastSeenAt` means.
 
 **Count your processes.** Every non-serverless host reports
 `resource.processes` — with `expected`, because the right number is a number you
-know — and `resource.orphans`. An orphan is a process that matches a service you
-manage but that no supervisor owns: reparented to init when its parent died, or
-left running by a release that half-restarted. `resource.processes` counts
-every live process matching a managed service, orphans included;
-`resource.orphans` is the subset nobody owns. An orphan holds memory, file handles,
-and sometimes a port, it is invisible to the supervisor that would have
-restarted it, and it is the reason a machine can be at 78% memory with every
-service reporting healthy.
+know — and `resource.orphans`. Processes counts every live process matching a
+service you manage, orphans included. An **orphan** is one no supervisor owns:
+reparented to init when its parent died, or left by a release that
+half-restarted. It holds memory, file handles, and sometimes a port, and the
+supervisor that would restart it cannot see it — which is how a machine sits at
+78% memory with every service reporting healthy.
 
 Serverless services set `serverless: true` and report no host. That is not a
 gap — there is nothing to watch.
@@ -717,9 +710,9 @@ Traffic is metrics scoped with `api` (§6.1):
 - A surface row's own metrics are that surface's total. Emit them or emit the
   operations, not both, or the totals double.
 
-Most API gateways, load balancers, and cloud CLIs already report request and
-error counts grouped by route. That grouping is the one to pull — the
-account-wide total is the number you already have and cannot act on.
+Most gateways, load balancers, and cloud CLIs already report request and error
+counts grouped by route. Pull that grouping — the account-wide total is the
+number you already have and cannot act on.
 
 ---
 
@@ -756,10 +749,10 @@ normal.
 }
 ```
 
-`expected` is the point. A run that succeeds while processing ten times its
-normal volume is a success by every check the job itself can make, and it is
-still the most interesting thing that happened last night. `status:
-"anomalous"` means it finished, and the numbers are outside the declared range.
+`expected` is the point. A run processing ten times its normal volume passes
+every check the job itself can make, and is still the most interesting thing that
+happened last night. `status: "anomalous"` means it finished with numbers outside
+the declared range.
 
 ---
 
@@ -1024,9 +1017,8 @@ franchise tax, registered agent, insurance, licences.
 }
 ```
 
-Losing good standing is slow, silent, and expensive to unwind. It is exactly the
-kind of thing a dashboard should say out loud months early, and exactly the kind
-of thing nobody remembers to check.
+Losing good standing is slow, silent, expensive to unwind, and nobody remembers
+to check. Say it out loud months early.
 
 ---
 
@@ -1052,8 +1044,8 @@ metric so it graphs.
 ```
 
 Present means the report is incomplete and says which part. The consumer shows a
-banner and keeps the last good value for those sections, marked stale. This is
-also where a dropped buffer (§2, rule 6) is confessed.
+banner and keeps the last good value for those sections, marked stale. A
+dropped buffer (§2, rule 6) is declared here too.
 
 ---
 
@@ -1168,12 +1160,12 @@ counters, balance present on `prepaid` and `quota` vendors and absent on
 than visibly broken.
 
 **3. Complete.** Recommended registry metrics present; `direction` set;
-`expected` set on jobs, on `resource.processes`, and on any metric with a known
-normal range; every operation in `apis[]` reporting both outcomes of
-`usage.requests`; every non-serverless host reporting `resource.processes` and
-`resource.orphans`; `featured` metrics present but under eight; `generatedAt` recent; every service has a host, inherits one from a
-parent, declares `serverless`, or is `kind: external`. *Warnings* — a business with no revenue is not
-a malformed business.
+`expected` on jobs, on `resource.processes`, and on any metric with a known
+normal range; both outcomes of `usage.requests` on every operation in `apis[]`;
+`resource.processes` and `resource.orphans` on every non-serverless host;
+`featured` metrics present but under eight; `generatedAt` recent; every service
+either has a host, inherits one, declares `serverless`, or is `kind: external`.
+*Warnings* — a business with no revenue is not a malformed business.
 
 **4. Live.** Against a real endpoint:
 
@@ -1184,8 +1176,8 @@ a malformed business.
   check that does.
 - **Cursor round trip:** call once, send `cursor.streams` back immediately, and
   confirm the second response repeats no stream item and returns watermarks that
-  are equal or later. This is the check that catches the race in §2 — a producer
-  stamping watermarks from a single "now" fails it.
+  are equal or later. It catches the race in §2: a producer stamping watermarks
+  from a single "now" fails it.
 
 Exit non-zero on errors, zero on warnings alone, and run it in each business's
 CI. A refactor that drops a metric should fail a pull request, not quietly blank
@@ -1197,8 +1189,7 @@ a chart.
 
 Acme Corp: a paid API with a web app, a self-hosted inference box, a collection
 service with four upstream sources, and the paperwork of a Delaware LLC. Every
-section is populated, every reference resolves, and the numbers agree with each
-other.
+section is populated, every reference resolves, and the numbers agree.
 
 The story it tells: source B has been dead for a day, `POST /v1/export` is
 failing every call, the hourly rollup just processed ten times its normal volume,
