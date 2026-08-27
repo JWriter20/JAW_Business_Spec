@@ -160,24 +160,25 @@ somewhere it can query by time.
   "funnel":      [ … ],   // the stages they pass through           §8
   "services":    [ … ],   // what we run                            §9
   "vendors":     [ … ],   // what we pay for                        §10
-  "hosts":       [ … ],   // machines we are responsible for        §11
-  "endpoints":   [ … ],   // URLs under health check               §12
-  "apis":        [ … ],   // every API surface and operation       §13
-  "jobs":        [ … ],   // crons and batches, with normal ranges  §14
-  "deployments": [ … ],   // what is running                       §15
+  "accounts":    [ … ],   // what we hold, and what it owes  §11
+  "hosts":       [ … ],   // machines we are responsible for        §12
+  "endpoints":   [ … ],   // URLs under health check               §13
+  "apis":        [ … ],   // every API surface and operation       §14
+  "jobs":        [ … ],   // crons and batches, with normal ranges  §15
+  "deployments": [ … ],   // what is running                       §16
 
-  "events":    [ … ],     // stream: notable things that happened  §16
-  "errors":    [ … ],     // stream: bucketed application errors   §17
-  "inbox":     [ … ],     // stream: new customer mail             §18
-  "issues":    [ … ],     // stream: public repo issues            §19
-  "ci":        [ … ],     // stream: failed CI and test runs       §20
+  "events":    [ … ],     // stream: notable things that happened  §17
+  "errors":    [ … ],     // stream: bucketed application errors   §18
+  "inbox":     [ … ],     // stream: new customer mail             §19
+  "issues":    [ … ],     // stream: public repo issues            §20
+  "ci":        [ … ],     // stream: failed CI and test runs       §21
 
-  "incidents":  [ … ],    // open and recently resolved            §21
-  "domains":    [ … ],    // registrations and expiry              §22
-  "compliance": [ … ],    // filings, registrations, insurance     §23
+  "incidents":  [ … ],    // open and recently resolved            §22
+  "domains":    [ … ],    // registrations and expiry              §23
+  "compliance": [ … ],    // filings, registrations, insurance     §24
 
-  "extra":       { … },   // free-form                             §24
-  "unavailable": [ … ]    // sections this report could not produce §24
+  "extra":       { … },   // free-form                             §25
+  "unavailable": [ … ]    // sections this report could not produce §25
 }
 ```
 
@@ -424,7 +425,12 @@ leak, a full disk, or a saturated NIC shows up.
 | `cost.per_unit` | `usd_cents` | gauge | down_good | `cost.total` ÷ `usage.units`. |
 | `cost.per_user` | `usd_cents` | gauge | down_good | `cost.total` ÷ active users. |
 | `margin.gross` | `ratio` | ratio | up_good | (net revenue − cost) ÷ net revenue. Set `signed: true`. |
-| `vendors.at_risk` | `count` | gauge | down_good | Accounts projected to hit zero before they reset or renew. |
+| `vendors.at_risk` | `count` | gauge | down_good | Accounts projected to hit zero before a reset, a renewal, or a working auto top-up refills them. |
+| `vendors.topup_failed` | `count` | gauge | down_good | Accounts on auto top-up whose payment method is not `ok`, or whose last top-up failed. |
+| `finance.cash` | `usd_cents` | gauge | up_good | Total across `accounts[]`. |
+| `finance.burn_net` | `usd_cents` | counter | down_good | Money out minus money in, across accounts, in the window. Negative when cash grew. |
+| `finance.runway_days` | `other` | gauge | up_good | Cash ÷ net burn. `unitLabel: "days"`. `null` while cash is growing. |
+| `finance.unreconciled` | `usd_cents` | gauge | down_good | Account outflow that no tracked vendor accounts for. |
 
 `cost.total` is everything. `cost.spend` rows are the breakdown, and there may
 be several axes — by our service, by host, by job, by vendor. **Sum within one
@@ -719,6 +725,14 @@ rolls. This is the section that answers "are expenditures getting out of hand".
     "unit": "bytes",
     "unitLabel": null
   },
+  "topUp": {                           // how the balance gets refilled
+    "mode": "manual",                  // REQUIRED for prepaid. auto | manual | none
+    "thresholdValue": null,            // balance that triggers an auto top-up
+    "amountCents": null,               // what each top-up charges
+    "paymentMethod": "ok",             // ok | expiring | failed | missing
+    "lastAt": "2026-08-04T09:12:00.000Z",
+    "lastFailedAt": null
+  },
   "exhaustsAt": "2026-08-29T00:00:00.000Z",   // null = not projected to run out
   "accountUrl": "https://example.com/billing",
   "asOf": "2026-08-26T18:03:40.000Z",
@@ -742,6 +756,33 @@ are not a balance.
 Ranking accounts by "days until zero" only works if the ones that never reset
 are distinguishable from the ones that do.
 
+#### `topUp` decides how much running out costs you
+
+Hitting zero on an account that refills itself is a charge. Hitting zero on one
+that needs a human is an outage. Same balance, same burn rate, completely
+different night.
+
+| `mode` | Hitting zero means |
+|---|---|
+| `auto` | The provider charges the card and service continues. A cost event, not an availability one. |
+| `manual` | Somebody has to notice and pay. **This is the outage case**, and it deserves to page days ahead. |
+| `none` | Nothing refills it. The account ends when the balance does. |
+
+**`auto` is only as good as the card behind it.** An auto top-up with an expired
+card is worse than manual, because nobody is watching a thing that has always
+worked. That is what `paymentMethod` is for, and why anything other than `ok`
+puts the account back in the at-risk set whatever `mode` says.
+
+The mirror image is worth saying too: auto top-up converts an availability risk
+into a spend risk. A runaway consumer against a manual account stops; against an
+auto account it bills. Put an `expected` band on that vendor's projected spend.
+
+**At risk** means projected to hit zero before anything refills it — where
+"anything" is a reset, a renewal, or a working auto top-up. A prepaid account on
+`auto` with a healthy card is not at risk. The same account with a card that is
+expiring, failed, or missing is, and so is any account on `manual` or `none`
+whose `exhaustsAt` lands before its `resetsAt`.
+
 **`exhaustsAt` vs `resetsAt`** is the comparison that matters: a quota that
 exhausts *after* it resets is fine forever; one that exhausts before is this
 month's problem. Prepaid has no reset, so the projection is simply a deadline.
@@ -764,7 +805,75 @@ the gap is spend the provider did not attribute.
 
 ---
 
-## 11. `hosts` — machines we are responsible for
+## 11. `accounts` — what we hold
+
+Bank accounts, processor balances, reserves. Money in, against §10's money out.
+Like vendors, an account carries its own figures inline; the business-wide
+roll-ups are metrics.
+
+```jsonc
+{
+  "id": "bank-operating",            // REQUIRED. stable
+  "name": "Operating account",       // REQUIRED
+  "kind": "bank",                    // REQUIRED. bank | processor | card
+                                     // | reserve | treasury | other
+  "connection": "read_only",         // REQUIRED. read_only | manual | none
+  "role": "operating",               // operating | tax | payouts | reserve
+  "currency": "usd",                 // REQUIRED
+  "balanceCents": 4821900,           // REQUIRED
+  "availableCents": 4712300,         // minus holds and pending debits
+  "pendingInCents": 312400,          // settling toward this account
+  "pendingOutCents": 109600,         // authorised, not yet settled
+  "flow": {                          // movement over the period
+    "window": "30d",
+    "inCents": 5120400,
+    "outCents": 233250
+  },
+  "institutionLast4": "4471",        // identification, never the account number
+  "asOf": "2026-08-26T06:00:00.000Z",
+  "note": null
+}
+```
+
+### Read-only, and balances only
+
+- **`connection: "read_only"`, or nothing.** A monitoring endpoint has no reason
+  to hold a credential that can move money, and this document is cached, logged,
+  and stored on a machine that is not the one holding the money.
+- **No account numbers, no routing details, no card numbers.** `institutionLast4`
+  is enough to tell two accounts apart.
+- **No transaction lists.** Balances and period totals only. Itemising
+  transactions turns a monitoring document into a copy of your bank statement,
+  and every finding here is an aggregate anyway.
+- `manual` is a legitimate connection. A balance typed in weekly with an honest
+  `asOf` still answers "how much runway is there".
+
+### Reconciliation is the point
+
+Two independent numbers should nearly agree: what the accounts say went out, and
+what the vendors say they charged.
+
+```
+finance.unreconciled  =  Σ accounts[].flow.outCents  −  Σ vendors[].spend, same period
+```
+
+Sum only top-level vendors — children are a breakdown of their parent, not extra
+spend. **Transfers between your own accounts are not flow.** A processor
+settling into the operating account is the same money arriving twice; net those
+out or the residual means nothing.
+
+A small residual is normal: one-time charges are deliberately out of §10 — a
+domain renewal, a laptop, a filing fee — and payroll and tax are not vendors at
+all. **A large or growing residual is the finding.** Spend you cannot name is
+either a vendor nobody is tracking or a charge nobody authorised, and both are
+expensive to learn about a month late.
+
+Put an `expected` band on it, so the alert fires when the number leaves the range
+it has held all year rather than every time it moves.
+
+---
+
+## 12. `hosts` — machines we are responsible for
 
 Identity only. CPU, memory, VRAM, disk, network, sockets are metrics scoped with
 `host` (§6.2, Machines).
@@ -808,7 +917,7 @@ gap — there is nothing to watch.
 
 ---
 
-## 12. `endpoints` — URLs under health check
+## 13. `endpoints` — URLs under health check
 
 ```jsonc
 {
@@ -834,7 +943,7 @@ belongs on the thing that serves it, not in a calendar somewhere.
 
 ---
 
-## 13. `apis` — every API surface and operation
+## 14. `apis` — every API surface and operation
 
 What the business exposes and how hard it is being called. One row per surface,
 one row per operation, linked by `parent` — the same nesting as services.
@@ -891,7 +1000,7 @@ number you already have and cannot act on.
 
 ---
 
-## 14. `jobs` — crons and batches
+## 15. `jobs` — crons and batches
 
 Point-in-time state of every scheduled thing, plus the range that counts as
 normal.
@@ -931,7 +1040,7 @@ the declared range.
 
 ---
 
-## 15. `deployments` — what is running
+## 16. `deployments` — what is running
 
 ```jsonc
 {
@@ -961,7 +1070,7 @@ button say where it is going before you press it.
 
 ---
 
-## 16. `events` — stream: notable things that happened
+## 17. `events` — stream: notable things that happened
 
 Everything a human would want told about after the fact. Only items after the
 `events` cursor.
@@ -995,7 +1104,7 @@ few hundred times a day it is a metric, not an event.
 
 ---
 
-## 17. `errors` — stream: bucketed application errors
+## 18. `errors` — stream: bucketed application errors
 
 **Grouped, never raw.** One entry per distinct failure, with a count. A thousand
 identical timeouts is one bucket with `count: 1000`.
@@ -1031,7 +1140,7 @@ identical timeouts is one bucket with `count: 1000`.
 
 ---
 
-## 18. `inbox` — stream: new customer mail
+## 19. `inbox` — stream: new customer mail
 
 Every support channel that receives customer messages, in one queue. Items after
 the `inbox` cursor.
@@ -1060,7 +1169,7 @@ another machine. Mask the address; the real one is behind the link.
 
 ---
 
-## 19. `issues` — stream: public repository issues
+## 20. `issues` — stream: public repository issues
 
 Links and titles only, and **public repositories only**. Issues opened or
 updated since the `issues` cursor.
@@ -1087,7 +1196,7 @@ Private repositories stay out — their titles leak roadmap and customers.
 
 ---
 
-## 20. `ci` — stream: failed builds and tests
+## 21. `ci` — stream: failed builds and tests
 
 Runs since the `ci` cursor that did not pass. Successes are a metric
 (`ci.pass_rate`), not a list.
@@ -1114,7 +1223,7 @@ Runs since the `ci` cursor that did not pass. Successes are a metric
 
 ---
 
-## 21. `incidents` — open and recently resolved
+## 22. `incidents` — open and recently resolved
 
 ```jsonc
 {
@@ -1143,7 +1252,7 @@ drop them.
 
 ---
 
-## 22. `domains`
+## 23. `domains`
 
 ```jsonc
 {
@@ -1163,11 +1272,11 @@ drop them.
 ```
 
 `autoRenew: false` on a domain the business is served from is a self-inflicted
-outage with a date on it. Certificates live on `endpoints[].tls` (§12).
+outage with a date on it. Certificates live on `endpoints[].tls` (§13).
 
 ---
 
-## 23. `compliance` — filings, registrations, insurance
+## 24. `compliance` — filings, registrations, insurance
 
 The paperwork that quietly expires: entity good standing, annual reports,
 franchise tax, registered agent, insurance, licences.
@@ -1197,7 +1306,7 @@ to check. Say it out loud months early.
 
 ---
 
-## 24. `extra` and `unavailable`
+## 25. `extra` and `unavailable`
 
 ```jsonc
 "extra": {
@@ -1224,7 +1333,7 @@ dropped buffer (§2, rule 6) is declared here too.
 
 ---
 
-## 25. Limits
+## 26. Limits
 
 | Thing | Cap | Over the cap |
 |---|---|---|
@@ -1232,6 +1341,7 @@ dropped buffer (§2, rule 6) is declared here too.
 | `metrics` | 1000 | Truncated, `featured` first. |
 | `services` | 200 | Truncated, `critical` first. |
 | `vendors` | 100 | Truncated, `crit` first. |
+| `accounts` | 50 | Truncated, largest balance first. |
 | `hosts` | 50 | Truncated. |
 | `endpoints` | 100 | Truncated, `down` first. |
 | `apis` | 500 | Truncated, most-called first, surfaces before operations. |
@@ -1258,7 +1368,7 @@ Snapshots truncate by dropping the least important rows, and are.
 
 ---
 
-## 26. Security
+## 27. Security
 
 This document is a complete operational picture of a company behind one bearer
 token, fetched by a machine that holds the same for every other company.
@@ -1275,7 +1385,9 @@ token, fetched by a machine that holds the same for every other company.
    For anything inherently internet-facing, the token is the primary control.
    Be precise about which you actually applied.
 5. **No secrets, no bodies, no PII.** No keys, tokens, passwords, connection
-   strings, customer documents, or message bodies. Mask email addresses. Error
+   strings, customer documents, or message bodies. No account, routing, or card
+   numbers, and no transaction lists — §11 is balances and totals, and the
+   connection behind it is read-only. Mask email addresses. Error
    samples carry identifiers, not payloads. Private repository issues stay out.
    The report is cached, logged, and stored on another machine; a backup of that
    machine is a backup of everything you ever put in a report.
@@ -1285,7 +1397,7 @@ token, fetched by a machine that holds the same for every other company.
 
 ---
 
-## 27. Versioning
+## 28. Versioning
 
 `spec` is `"business-report/<major>"`. Consumers accept the current major and
 the one before it.
@@ -1300,7 +1412,7 @@ that lies about last month.
 
 ---
 
-## 28. Conformance
+## 29. Conformance
 
 A checker takes a report from a file, or from a live endpoint with a token, and
 runs four passes.
@@ -1319,8 +1431,16 @@ stage, balance present on `prepaid` and `quota` vendors and absent on
   `hosts[].services`, `apis[].service`, and `endpoints[].service` resolves. No
   parent cycles.
 - The metric identity tuple (§6.1) is unique.
-- `vendors.at_risk` equals the vendors actually projected to hit zero before
-  anything refills them, and none of those reports `status: ok`.
+- `vendors.at_risk` equals the vendors projected to hit zero before a reset, a
+  renewal, or an auto top-up with a healthy payment method refills them, and
+  none of those reports `status: ok`.
+- `vendors.topup_failed` equals the accounts on `auto` whose `paymentMethod` is
+  not `ok` or whose last top-up failed.
+- `finance.cash` equals the sum of `accounts[].balanceCents`.
+- `finance.unreconciled` equals account outflow minus top-level vendor spend for
+  the same period, where both are present.
+- Every account declares a `connection`, and none carries an account number or a
+  transaction list.
 - `incidents.open` equals the unresolved entries in `incidents[]`.
 - `domains.expiring` and `compliance.due` agree with their lists.
 - Every `expected` has `min <= max`.
@@ -1377,8 +1497,10 @@ failing every call, the hourly rollup just processed ten times its normal volume
 the worker's memory is above its range with an orphaned process left over from a
 restart, a GPU is over its temperature band, the proxy balance runs out in three
 days, one domain is 21 days from expiry with auto-renew off, the franchise tax
-is due, and paid search is bringing a quarter of the traffic, a tenth of the
-signups, and an LTV only 1.9x its CAC.
+is due, paid search is bringing a quarter of the traffic, a tenth of the signups
+and an LTV only 1.9x its CAC, and $196 of card spend belongs to no tracked
+vendor. The LLM account also runs dry this week and does not appear as a risk,
+because it tops itself up.
 
 ```json
 {
@@ -1462,7 +1584,7 @@ signups, and an LTV only 1.9x its CAC.
     { "id": "usage.requests", "label": "Source C rows", "value": 6120, "unit": "count", "kind": "counter", "window": "24h", "service": "ingest.source-c", "group": "Ingest", "direction": "up_good" },
     { "id": "usage.requests", "label": "Source D rows", "value": 3902, "unit": "count", "kind": "counter", "window": "24h", "service": "ingest.source-d", "group": "Ingest", "direction": "up_good" },
 
-    { "id": "queue.depth", "label": "Queue depth", "value": 1841, "unit": "count", "kind": "gauge", "service": "queue", "group": "Reliability", "direction": "down_good", "expected": { "min": 0, "max": 2500 }, "featured": true },
+    { "id": "queue.depth", "label": "Queue depth", "value": 1841, "unit": "count", "kind": "gauge", "service": "queue", "group": "Reliability", "direction": "down_good", "expected": { "min": 0, "max": 2500 } },
     { "id": "queue.oldest_age", "label": "Oldest queued item", "value": 92, "unit": "seconds", "kind": "gauge", "service": "queue", "group": "Reliability", "direction": "down_good" },
     { "id": "queue.dlq_depth", "label": "Dead letters", "value": 12, "unit": "count", "kind": "gauge", "service": "queue", "group": "Reliability", "direction": "down_good" },
 
@@ -1502,7 +1624,12 @@ signups, and an LTV only 1.9x its CAC.
     { "id": "cost.per_unit", "label": "Cost per credit", "value": 15, "unit": "usd_cents", "kind": "gauge", "window": "30d", "group": "Cost", "direction": "down_good" },
     { "id": "cost.per_user", "label": "Cost per active user", "value": 31, "unit": "usd_cents", "kind": "gauge", "window": "30d", "group": "Cost", "direction": "down_good" },
     { "id": "margin.gross", "label": "Gross margin", "value": 0.9594, "unit": "ratio", "kind": "ratio", "window": "30d", "group": "Cost", "direction": "up_good", "signed": true },
-    { "id": "vendors.at_risk", "label": "Accounts running out", "value": 1, "unit": "count", "kind": "gauge", "group": "Cost", "direction": "down_good" },
+    { "id": "vendors.at_risk", "label": "Accounts running out", "value": 1, "unit": "count", "kind": "gauge", "group": "Cost", "direction": "down_good", "note": "The proxy account, which is manual. The LLM account also hits zero this week but tops itself up." },
+    { "id": "vendors.topup_failed", "label": "Auto top-ups at risk", "value": 0, "unit": "count", "kind": "gauge", "group": "Cost", "direction": "down_good", "expected": { "min": 0, "max": 0 } },
+    { "id": "finance.cash", "label": "Cash on hand", "value": 6974300, "unit": "usd_cents", "kind": "gauge", "group": "Finance", "direction": "up_good", "featured": true },
+    { "id": "finance.burn_net", "label": "Net burn", "value": -4887150, "unit": "usd_cents", "kind": "counter", "window": "30d", "group": "Finance", "direction": "down_good", "note": "Negative: cash grew by $48,871 over the period." },
+    { "id": "finance.runway_days", "label": "Runway", "value": null, "unit": "other", "unitLabel": "days", "kind": "gauge", "group": "Finance", "direction": "up_good", "note": "Cash is growing, so runway does not apply." },
+    { "id": "finance.unreconciled", "label": "Unaccounted spend", "value": 19600, "unit": "usd_cents", "kind": "gauge", "window": "30d", "group": "Finance", "direction": "down_good", "expected": { "min": 0, "max": 40000 }, "note": "$196 of card spend no tracked vendor claims — a domain renewal and a monitor. Inside the usual band." },
 
     { "id": "inbox.unread", "label": "Unanswered mail", "value": 2, "unit": "count", "kind": "gauge", "group": "Support", "direction": "down_good" },
     { "id": "inbox.oldest_age", "label": "Longest wait", "value": 1320, "unit": "seconds", "kind": "gauge", "group": "Support", "direction": "down_good" },
@@ -1625,6 +1752,7 @@ signups, and an LTV only 1.9x its CAC.
       "plan": { "name": "Pay as you go", "cents": null, "interval": "none" },
       "spend": { "periodToDateCents": 4500, "projectedPeriodCents": 6000, "lastInvoiceCents": 20000, "asOf": "2026-08-26T06:00:00.000Z" },
       "usage": { "used": 159000000000, "included": 200000000000, "remaining": 41000000000, "unit": "bytes" },
+      "topUp": { "mode": "manual", "paymentMethod": "ok", "lastAt": "2026-08-04T09:12:00.000Z", "lastFailedAt": null },
       "exhaustsAt": "2026-08-29T00:00:00.000Z",
       "accountUrl": "https://example.com/proxy/billing", "asOf": "2026-08-26T18:03:40.000Z",
       "note": "At zero the gateway stops serving until it is topped up." },
@@ -1644,7 +1772,10 @@ signups, and an LTV only 1.9x its CAC.
       "plan": { "name": "Prepaid credits", "cents": null, "interval": "none" },
       "spend": { "periodToDateCents": 62400, "projectedPeriodCents": 74000, "asOf": "2026-08-26T06:00:00.000Z" },
       "usage": { "used": 184000000, "included": null, "remaining": 41000000, "unit": "tokens" },
-      "exhaustsAt": null, "asOf": "2026-08-26T18:03:40.000Z" },
+      "topUp": { "mode": "auto", "thresholdValue": 20000000, "amountCents": 20000,
+                 "paymentMethod": "ok", "lastAt": "2026-08-22T02:41:00.000Z", "lastFailedAt": null },
+      "exhaustsAt": "2026-09-02T00:00:00.000Z", "asOf": "2026-08-26T18:03:40.000Z",
+      "note": "Runs out in 7 days and tops itself up for $200. A charge, not an outage — so not at risk." },
 
     { "id": "email", "name": "Transactional email", "billing": "postpaid", "status": "ok", "category": "saas",
       "services": ["api"],
@@ -1665,6 +1796,23 @@ signups, and an LTV only 1.9x its CAC.
       "usage": { "used": 4820, "included": 5000, "remaining": 180, "unit": "count", "unitLabel": "events" },
       "asOf": "2026-08-26T18:03:40.000Z",
       "note": "96% of the free event ceiling. Over it, errors stop being recorded." }
+  ],
+
+  "accounts": [
+    { "id": "bank-operating", "name": "Operating account", "kind": "bank", "connection": "read_only",
+      "role": "operating", "currency": "usd",
+      "balanceCents": 4821900, "availableCents": 4712300,
+      "pendingInCents": 312400, "pendingOutCents": 109600,
+      "flow": { "window": "30d", "inCents": 5120400, "outCents": 233250 },
+      "institutionLast4": "4471", "asOf": "2026-08-26T06:00:00.000Z" },
+    { "id": "bank-tax", "name": "Tax reserve", "kind": "reserve", "connection": "read_only",
+      "role": "tax", "currency": "usd", "balanceCents": 1840000,
+      "institutionLast4": "9032", "asOf": "2026-08-26T06:00:00.000Z",
+      "note": "Set aside quarterly. No flow reported — transfers in are from the operating account." },
+    { "id": "processor", "name": "Payment processor balance", "kind": "processor", "connection": "read_only",
+      "role": "payouts", "currency": "usd", "balanceCents": 312400,
+      "asOf": "2026-08-26T18:03:30.000Z",
+      "note": "Settles to the operating account every two days. Transfers are not flow." }
   ],
 
   "hosts": [
