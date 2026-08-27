@@ -129,20 +129,21 @@ the next request. It never invents a watermark from its own clock.
    to the cap, sets that stream's watermark to the last item returned, and sets
    `cursor.complete: false`. The consumer polls again immediately rather than
    waiting for the next tick.
-5. **Buffers flush on acknowledgement, not on read.** A producer buffering
-   errors or events may discard what is older than a cursor a consumer has
-   *since sent back*. Discarding on read loses the buffer whenever the consumer
-   fails to write the response it just drained.
-6. **Bound the buffer anyway.** If it overflows before acknowledgement, drop
-   oldest, and say so in `unavailable[]`. A silent gap is the one failure this
-   design is trying to prevent.
+### If a stream lives only in memory
 
-**Most producers need no buffer.** If a stream is durably stored and queryable
-by timestamp — rows in a table, events in an index — answer from the query and
-ignore rules 5 and 6 entirely. Buffers exist only for things held in memory. A
-producer that cannot keep state between requests at all, such as a serverless
-function, has no buffer available and must therefore persist its streams
-somewhere it can query by time.
+Most do not. If a stream is durably stored and queryable by timestamp — rows in
+a table, events in an index — answer from the query and skip this. A producer
+that cannot keep state between requests at all, such as a serverless function,
+has no buffer available and must persist its streams somewhere it can query.
+
+For anything held in memory, such as error counters in a long-lived process:
+
+- **Flush on acknowledgement, not on read.** Discard what is older than a cursor
+  the consumer has *since sent back*. Discarding on read loses the buffer
+  whenever the consumer fails to store the response it just drained.
+- **Bound the buffer anyway.** If it overflows before acknowledgement, drop
+  oldest and say so in `unavailable[]`. A silent gap is the one failure this
+  design exists to prevent.
 
 ---
 
@@ -437,9 +438,9 @@ be several axes — by our service, by host, by job, by vendor. **Sum within one
 label, never across.** The same dollar appears once per axis, so adding a
 by-service row to a by-host row counts it twice.
 
-The vendor axis is usually free — bills arrive itemized. Attributing spend to
-your *own* services generally needs resource tagging you may not have, so an
-estimate with a `note` beats an omission, and no breakdown at all is fine.
+The vendor axis is usually free, since bills arrive itemised. Attributing spend
+to your *own* services needs resource tagging you may not have — an estimate
+with a `note` beats an omission, and no breakdown at all is fine.
 
 **Acquisition and funnel** — scope with `source` and `stage`.
 
@@ -470,12 +471,11 @@ missing:
 `users.total` · `usage.requests` · `usage.success_rate` · `incidents.open` ·
 `cost.total`
 
-The list is short deliberately. **Missing is a warning, not a failure**, and
-several businesses will dismiss several of them permanently: a business with no
-cost API cannot report `cost.total`, one with no analytics cannot count active
-users, a prepaid business has no `revenue.mrr`. That is the intended outcome — a
-warning you have read and dismissed beats a fabricated number that makes the
-cross-company chart lie. Nothing else in the registry is expected of anyone.
+Short deliberately, and **missing is a warning, not a failure**. Most businesses
+will dismiss one or two forever — a business with no cost API cannot report
+`cost.total` — which is the intended outcome. A warning you have read beats a
+fabricated number that makes the cross-company chart lie. Nothing else in the
+registry is expected of anyone.
 
 ### 6.3 Units
 
@@ -740,7 +740,7 @@ rolls. This is the section that answers "are expenditures getting out of hand".
 }
 ```
 
-### `billing` decides what running out costs you
+### `billing` — does the balance come back?
 
 | Value | `usage.remaining` | Running out means |
 |---|---|---|
@@ -753,10 +753,7 @@ rolls. This is the section that answers "are expenditures getting out of hand".
 `usage.included` are legal on any billing mode — metering and a plan allowance
 are not a balance.
 
-Ranking accounts by "days until zero" only works if the ones that never reset
-are distinguishable from the ones that do.
-
-#### `topUp` decides how much running out costs you
+### `topUp` — does anybody have to act?
 
 Hitting zero on an account that refills itself is a charge. Hitting zero on one
 that needs a human is an outage. Same balance, same burn rate, completely
@@ -777,17 +774,16 @@ The mirror image is worth saying too: auto top-up converts an availability risk
 into a spend risk. A runaway consumer against a manual account stops; against an
 auto account it bills. Put an `expected` band on that vendor's projected spend.
 
-**At risk** means projected to hit zero before anything refills it — where
-"anything" is a reset, a renewal, or a working auto top-up. A prepaid account on
-`auto` with a healthy card is not at risk. The same account with a card that is
-expiring, failed, or missing is, and so is any account on `manual` or `none`
-whose `exhaustsAt` lands before its `resetsAt`.
+**At risk** means projected to hit zero before anything refills it — a reset, a
+renewal, or a working auto top-up. The comparison is `exhaustsAt` against
+`resetsAt`: a quota that exhausts *after* it resets is fine forever; one that
+exhausts before is this month's problem. Prepaid has no reset, so the projection
+is simply a deadline. Omit `exhaustsAt` and the consumer projects it from its own
+history — weeks of curve rather than one window's average.
 
-**`exhaustsAt` vs `resetsAt`** is the comparison that matters: a quota that
-exhausts *after* it resets is fine forever; one that exhausts before is this
-month's problem. Prepaid has no reset, so the projection is simply a deadline.
-Omit `exhaustsAt` and the consumer projects it from its own history, which is
-usually better — it has weeks of curve, not one window's average.
+Ranking accounts by "days until zero" only means something if the ones that
+never reset, and the ones that refill themselves, are distinguishable from the
+ones that do neither.
 
 **Recurring and metered spend only.** One-time charges — a domain purchase, a
 GPU, an annual filing fee — stay out by default; this section is for monitoring
@@ -1136,7 +1132,7 @@ identical timeouts is one bucket with `count: 1000`.
   `firstSeenAt` inside it is a regression you just shipped. Cheap to record, and
   it is the field that says which.
 - **No PII and no payloads.** `sample` carries identifiers, not bodies.
-- Cap at 100 buckets sorted by `count`, then apply the truncation rule in §2.
+- Cap at 100 buckets sorted by `count`, then truncate as §2 says.
 
 ---
 
@@ -1329,7 +1325,7 @@ metric so it graphs.
 
 Present means the report is incomplete and says which part. The consumer shows a
 banner and keeps the last good value for those sections, marked stale. A
-dropped buffer (§2, rule 6) is declared here too.
+dropped buffer (§2) is declared here too.
 
 ---
 
@@ -1349,11 +1345,11 @@ dropped buffer (§2, rule 6) is declared here too.
 | `funnel` | 20 | Truncated from the bottom of the funnel up. |
 | `jobs` | 100 | Truncated, not-`ok` first. |
 | `deployments` | 100 | Truncated. |
-| `events` | 500 | §2 rule 4. |
-| `errors` | 100 buckets | §2 rule 4, by `count` descending. |
-| `inbox` | 100 | §2 rule 4. |
-| `issues` | 100 | §2 rule 4. |
-| `ci` | 100 | §2 rule 4. |
+| `events` | 500 | §2, truncation. |
+| `errors` | 100 buckets | §2, truncation, by `count` descending. |
+| `inbox` | 100 | §2, truncation. |
+| `issues` | 100 | §2, truncation. |
+| `ci` | 100 | §2, truncation. |
 | `incidents` | 100 | Truncated, `critical` first. |
 | `domains` | 200 | Truncated, soonest expiry first. |
 | `compliance` | 100 | Truncated, soonest due first. |
@@ -1363,7 +1359,7 @@ dropped buffer (§2, rule 6) is declared here too.
 Sort before you truncate. Send the 100 error buckets that matter, not the 100
 the query returned first.
 
-Streams truncate with a watermark (§2 rule 4) and are therefore never lossy.
+Streams truncate with a watermark (§2, truncation) and are therefore never lossy.
 Snapshots truncate by dropping the least important rows, and are.
 
 ---
