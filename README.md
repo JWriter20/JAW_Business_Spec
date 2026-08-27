@@ -365,8 +365,22 @@ If the business has the concept, it uses the registry id. That is what makes
 "revenue across all companies" a chart instead of a research project. Anything
 else is custom and must be namespaced with the business id: `acme.solve.accuracy`.
 
-Reporting a registry id with a different unit or direction is an error, not a
-style choice — `cost.total` with `direction: up_good` paints rising spend green.
+Reporting a registry id with a different unit is an error, not a style choice.
+`direction` is nearly as fixed — `cost.total` with `direction: up_good` paints
+rising spend green — with two exceptions the registry cannot express in one
+column:
+
+- **`outcome: "failure"` inverts it.** `usage.requests` is `up_good`; the same id
+  with `outcome: "failure"` is `down_good`. Requests climbing is growth; failed
+  requests climbing is not, and a green line is the one reading that must never
+  happen.
+- **`neutral` is always available**, and is the honest answer where the scope
+  makes the registry's sense wrong. `usage.units` scoped to a vendor is tokens
+  you are billed for, not units you sold; a job's row count is judged against its
+  `expected` band, not by which way it moved.
+
+Anything else — the registry's direction reversed for any other reason — is an
+error.
 
 **Revenue and payments** — `usd_cents`, unless noted.
 
@@ -950,6 +964,13 @@ Sum only top-level vendors — children are a breakdown of their parent, not ext
 spend. **Transfers between your own accounts are not flow.** A processor
 settling into the operating account is the same money arriving twice; net those
 out or the residual means nothing.
+
+**Both sides must be the same window, and vendor spend is the side that cannot
+move.** Billing APIs report month to date, and §6.4 says not to convert that to
+`30d` by arithmetic — so set `accounts[].flow.window` to `mtd` and report
+`finance.unreconciled` at `mtd` as well. A 30-day flow against a month-to-date
+bill produces a residual that climbs all month and resets on the 1st, which
+reads exactly like the finding this number exists to surface.
 
 A small residual is normal: one-time charges are deliberately out of §10 — a
 domain renewal, a laptop, a filing fee — and payroll and tax are not vendors at
@@ -1560,8 +1581,8 @@ runs four passes.
 shapes, money integral, ratios in 0–1 unless `signed`, `unitLabel` set whenever
 `unit` is `other`, `window` set on counters and drawn from §6.4, `cohort` present
 on every cohort-basis funnel stage, balance present on `prepaid` and `quota`
-vendors and absent on `postpaid` and `free`, `usdCents` present on every account
-not denominated in `usd`. *Errors.*
+vendors, absent on `postpaid`, and optional on `free` (§10), `usdCents` present
+on every account not denominated in `usd`. *Errors.*
 
 **2. Consistent.** The document agrees with itself:
 
@@ -1571,6 +1592,9 @@ not denominated in `usd`. *Errors.*
   `hosts[].services`, `apis[].service`, and `endpoints[].service` resolves. No
   parent cycles.
 - The metric identity tuple (§6.1) is unique.
+- Every registry metric id carries the registry's unit, and a `direction` that is
+  the registry's, its inverse where `outcome` is `failure`, or `neutral` (§6.2).
+  Nothing else in the document catches a cost metric painted green.
 - `vendors.at_risk` equals the vendors projected to hit zero before a reset, a
   renewal, or an auto top-up with a healthy payment method refills them, and
   none of those reports `status: ok`.
@@ -1799,9 +1823,9 @@ index that stopped being used.
     { "id": "vendors.at_risk", "label": "Accounts running out", "value": 1, "unit": "count", "kind": "gauge", "group": "Cost", "direction": "down_good", "note": "The proxy account, which is manual. The LLM account also hits zero this week but tops itself up." },
     { "id": "vendors.topup_failed", "label": "Auto top-ups at risk", "value": 0, "unit": "count", "kind": "gauge", "group": "Cost", "direction": "down_good", "expected": { "min": 0, "max": 0 } },
     { "id": "finance.cash", "label": "Cash on hand", "value": 6974300, "unit": "usd_cents", "kind": "gauge", "group": "Finance", "direction": "up_good", "featured": true },
-    { "id": "finance.burn_net", "label": "Net burn", "value": -4887150, "unit": "usd_cents", "kind": "counter", "window": "30d", "group": "Finance", "direction": "down_good", "note": "Negative: cash grew by $48,871 over the period." },
+    { "id": "finance.burn_net", "label": "Net burn", "value": -4887150, "unit": "usd_cents", "kind": "counter", "window": "mtd", "group": "Finance", "direction": "down_good", "note": "Negative: cash grew by $48,871 over the period." },
     { "id": "finance.runway_days", "label": "Runway", "value": null, "unit": "other", "unitLabel": "days", "kind": "gauge", "group": "Finance", "direction": "up_good", "note": "Cash is growing, so runway does not apply." },
-    { "id": "finance.unreconciled", "label": "Unaccounted spend", "value": 19600, "unit": "usd_cents", "kind": "gauge", "window": "30d", "group": "Finance", "direction": "down_good", "expected": { "min": 0, "max": 40000 }, "note": "$196 of card spend no tracked vendor claims — a domain renewal and a monitor. Inside the usual band." },
+    { "id": "finance.unreconciled", "label": "Unaccounted spend", "value": 19600, "unit": "usd_cents", "kind": "gauge", "window": "mtd", "group": "Finance", "direction": "down_good", "expected": { "min": 0, "max": 40000 }, "note": "$196 of card spend no tracked vendor claims — a domain renewal and a monitor. Matches the vendor period (mtd). Inside the usual band." },
 
     { "id": "inbox.unread", "label": "Unanswered mail", "value": 2, "unit": "count", "kind": "gauge", "group": "Support", "direction": "down_good" },
     { "id": "inbox.oldest_age", "label": "Longest wait", "value": 1320, "unit": "seconds", "kind": "gauge", "group": "Support", "direction": "down_good" },
@@ -1975,7 +1999,7 @@ index that stopped being used.
       "role": "operating", "currency": "usd",
       "balanceCents": 4821900, "availableCents": 4712300,
       "pendingInCents": 312400, "pendingOutCents": 109600,
-      "flow": { "window": "30d", "inCents": 5120400, "outCents": 233250 },
+      "flow": { "window": "mtd", "inCents": 5120400, "outCents": 233250 },
       "institutionLast4": "4471", "asOf": "2026-08-26T06:00:00.000Z" },
     { "id": "bank-tax", "name": "Tax reserve", "kind": "reserve", "connection": "read_only",
       "role": "tax", "currency": "usd", "balanceCents": 1840000,
