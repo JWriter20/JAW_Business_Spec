@@ -1,4 +1,4 @@
-# JAW Business Reporting Spec — `JAW_Business_Spec/v1`
+# JAW Business Reporting Spec — `jaw-business-report/1`
 
 One authenticated endpoint per business. One JSON document. One shape, whatever
 the business does.
@@ -42,14 +42,14 @@ Returns `200 application/json` with a Business Report.
 |---|---|
 | `since` | ISO-8601 instant. One watermark for every stream. Use on the first call, or from a consumer that keeps one clock. |
 | `cursor` | URL-encoded JSON: the `cursor.streams` object from the previous response. Per-stream watermarks. Wins over `since` for any stream it names. |
-| `sections` | Comma-separated top-level keys to return. Optional; a business may ignore it. |
+| `sections` | Comma-separated top-level keys to return. Optional; a business may ignore it. A filtered response still returns a complete `cursor` (§2, rule 5). |
 
 `since` and `cursor` are the whole request contract; what to collect is the
 business's decision.
 
 No `since` and no `cursor` means a first call: return current state plus a
-bounded backfill for the streams — 24 hours by default — and report the
-watermark you actually used.
+bounded backfill for the streams — 24 hours by default — and say how far back
+you went in `cursor.from`.
 
 ### Response codes
 
@@ -57,6 +57,7 @@ watermark you actually used.
 |---|---|---|
 | `200` | A report was produced, even a partial one. | Render it. `unavailable[]` becomes a banner. |
 | `401` | Missing or bad token. | Red tile. No retry storm. |
+| `403` | The caller is not on the allowlist (§27). The token was never read. | Red tile, worded differently from `401`. Do not rotate the token. |
 | `429` | Rate limited. | Back off, honour `Retry-After`. |
 | `503` | No report is possible at all. | Red tile, keep the last snapshot, mark it stale. |
 
@@ -67,7 +68,7 @@ one section, not the page.
 
 - Under **2 s** at p95. Consumer timeout is 10 s.
 - Default poll **60 s**.
-- `Cache-Control: no-store`.
+- `Cache-Control: no-store`. Compress the body; send `Retry-After` with every `429`.
 - Expensive to assemble? Serve a precomputed snapshot and set
   `business.ttlSeconds` to how stale it may be. The consumer shows the age
   instead of implying the number is live.
@@ -80,7 +81,7 @@ Sections are one of two kinds, and the kind decides how `since` applies.
 
 | Kind | Sections | `since` |
 |---|---|---|
-| **Snapshot** | `metrics`, `services`, `vendors`, `hosts`, `endpoints`, `jobs`, `deployments`, `domains`, `compliance`, `incidents` | Ignored. Always current and complete. |
+| **Snapshot** | `metrics`, `services`, `vendors`, `accounts`, `hosts`, `endpoints`, `sources`, `funnel`, `apis`, `jobs`, `deployments`, `domains`, `compliance`, `incidents` | Ignored. Always current and complete. |
 | **Stream** | `events`, `errors`, `inbox`, `issues`, `ci` | Return only items after the watermark. |
 
 Each stream is ordered by one timestamp field. That field is what "after the
@@ -99,6 +100,7 @@ cursor" means, and what a checker compares against:
 ```jsonc
 "cursor": {
   "requestedSince": "2026-08-26T17:04:03.114Z",  // echoed, or null on a first call
+  "from": "2026-08-26T17:04:03.114Z",            // start of what this response covers
   "streams": {
     "events": "2026-08-26T18:03:58.902Z",
     "errors": "2026-08-26T18:03:59.417Z",
@@ -113,6 +115,10 @@ cursor" means, and what a checker compares against:
 The consumer stores `cursor.streams` verbatim and sends it back as `cursor` on
 the next request. It never invents a watermark from its own clock.
 
+`from` is where coverage begins: the requested cursor, or the backfill start on a
+first call. Without it a first response cannot say whether it carried 24 hours or
+20 minutes.
+
 ### Rules
 
 1. **Per-stream watermarks, not one.** Each stream's query finishes at a
@@ -123,12 +129,29 @@ the next request. It never invents a watermark from its own clock.
    visible** — normally when that query finished, earlier if writes can commit
    out of order. Under-reporting the watermark costs a duplicate. Over-reporting
    costs a permanent gap. Choose duplicates.
-3. **Delivery is at-least-once.** Every stream item carries a stable `id`. The
-   consumer deduplicates on it.
-4. **Truncation is not loss.** A stream over its cap returns the oldest items up
-   to the cap, sets that stream's watermark to the last item returned, and sets
-   `cursor.complete: false`. The consumer polls again immediately rather than
-   waiting for the next tick.
+3. **Delivery is at-least-once, and `id` means one of two things.**
+   - `events`, `inbox`, `ci` — one `id` per item. A repeat is a duplicate; drop it.
+   - `errors`, `issues` — `id` names a bucket or an issue, and it comes back every
+     time that thing changes. Upsert on `id`. What separates a duplicate from an
+     update is `(id, lastSeenAt)` and `(id, updatedAt)`.
+
+   Never add an error bucket's `count` to what you already stored for the same
+   `lastSeenAt`. Rule 2 makes duplicates deliberate, and summing them inflates the
+   number every time one arrives.
+4. **Truncation is not loss — except for `errors`.** A stream over its cap returns
+   the oldest items up to the cap, sets that stream's watermark to the last item
+   returned, and sets `cursor.complete: false`. The consumer polls again
+   immediately rather than waiting for the next tick.
+
+   `errors` is ranked by `count`, not by time (§18), so the buckets it drops are
+   not the newest ones and polling again will not bring them back. It advances its
+   watermark as usual, sets `complete: false`, and declares the overflow in
+   `unavailable[]`. Ranked truncation loses the tail; say so.
+5. **`sections` never shortens the cursor.** A filtered response returns
+   `cursor.streams` for every stream the business supports, echoing the requested
+   watermark unchanged for any stream it did not collect. A cursor with keys
+   missing overwrites what the consumer stored, and that is a silent gap.
+
 ### If a stream lives only in memory
 
 Most do not. If a stream is durably stored and queryable by timestamp — rows in
@@ -151,7 +174,7 @@ For anything held in memory, such as error counters in a long-lived process:
 
 ```jsonc
 {
-  "spec": "JAW_Business_Spec/v1",  // REQUIRED, exact string
+  "spec": "jaw-business-report/1",  // REQUIRED, exact string
   "cursor":   { … },            // REQUIRED
   "business": { … },            // REQUIRED
   "status":   { … },            // REQUIRED
@@ -195,6 +218,32 @@ it has an API behind it.
 
 Unknown top-level keys are ignored, not rejected. Unknown enum values are read
 as `"unknown"`.
+
+### Conventions every section shares
+
+**Ids** are stable, unique within their section, at most 128 characters, and
+printable ASCII with no newlines and no leading or trailing space. They are join
+keys in the consumer's database, so a renamed id is a new object with no
+history.
+
+**Timestamps** are RFC 3339, UTC, milliseconds, `Z` —
+`2026-08-26T18:04:00.112Z`. Watermarks get compared as strings, and one local
+offset breaks that.
+
+**Derived fields** — `daysRemaining` and its like — are conveniences computed from
+the absolute date beside them. Where the two disagree, the absolute date wins.
+
+**Two enums, everywhere:**
+
+| | Values | Used by |
+|---|---|---|
+| Availability | `up` · `degraded` · `down` · `unknown` | `services`, `hosts`, `endpoints`, `apis`, `deployments` (which adds `deploying`) |
+| Severity | `ok` · `warn` · `crit` · `unknown` | `metrics[].severity`, `vendors[].status`, `events[].severity`, `incidents[].severity` |
+
+`status.level` (§5) is the one exception: it adds `down` for "customers are
+affected right now". On an event or an incident, `ok` is where you would
+otherwise have written "info". `errors[].level` is the log level your tracker
+already assigned, not this scale.
 
 ---
 
@@ -252,7 +301,7 @@ support response time.
   "label": "API p95 latency",  // REQUIRED. the UI never needs to know what an id means
   "value": 412,                // REQUIRED. number, or null for "not available"
   "unit": "ms",                // REQUIRED. §6.3
-  "kind": "gauge",             // gauge | counter | ratio        (default gauge)
+  "kind": "gauge",             // gauge | counter                (default gauge)
   "window": "5m",              // REQUIRED for counters: what period the value covers
   "service": "api",            // scope: §6.1
   "instance": null,            // dimension within a scope: a mount, a GPU, a queue
@@ -303,9 +352,12 @@ A metric may name what it is about. All are optional; more than one may be set.
 Unscoped means business-wide. `revenue.net` with no scope is the company's;
 `revenue.net` with `service: "api"` is that product line's.
 
-**Identity is `id` plus every scope label above**, and it must be unique in the
-document. Everything else — which services are busy, which are idle, which earn
-money, which leak memory — is a group-by on the consumer's side.
+**Identity is `id`, `window`, and every scope label above**, and it must be
+unique in the document. One id and scope may carry only one window per report —
+`revenue.gross` at `30d` and at `mtd` are two rows, and a consumer that ignores
+`window` overwrites one with the other. Everything else — which services are
+busy, which are idle, which earn money, which leak memory — is a group-by on the
+consumer's side.
 
 ### 6.2 Registry
 
@@ -351,11 +403,11 @@ style choice — `cost.total` with `direction: up_good` paints rising spend gree
 | `engagement.dau` | `count` | gauge | up_good | Distinct users active today. |
 | `engagement.wau` | `count` | gauge | up_good | Last 7 days. |
 | `engagement.mau` | `count` | gauge | up_good | Last 30 days. |
-| `engagement.stickiness` | `ratio` | ratio | up_good | DAU ÷ MAU. |
+| `engagement.stickiness` | `ratio` | gauge | up_good | DAU ÷ MAU. |
 | `engagement.sessions_per_user` | `count` | gauge | up_good | Per active user, in the window. |
 | `engagement.actions_per_user` | `count` | gauge | up_good | Core actions per active user. |
 | `engagement.session_seconds_p50` | `seconds` | gauge | up_good | Median session length. |
-| `engagement.retention_d30` | `ratio` | ratio | up_good | Of a cohort 30 days old, still active. |
+| `engagement.retention_d30` | `ratio` | gauge | up_good | Of a cohort 30 days old, still active. |
 
 **Usage and speed** — scope to a service to compare services.
 
@@ -363,8 +415,8 @@ style choice — `cost.total` with `direction: up_good` paints rising spend gree
 |---|---|---|---|---|
 | `usage.requests` | `count` | counter | up_good | Requests served in the window. |
 | `usage.units` | `count`\|`credits`\|`tokens` | counter | up_good | Billable units. Unit is not pinned — a delivered job at one business, a credit at another. |
-| `usage.success_rate` | `ratio` | ratio | up_good | Succeeded ÷ attempted. |
-| `usage.error_rate` | `ratio` | ratio | down_good | Errored ÷ attempted. |
+| `usage.success_rate` | `ratio` | gauge | up_good | Succeeded ÷ attempted. |
+| `usage.error_rate` | `ratio` | gauge | down_good | Errored ÷ attempted. |
 | `usage.latency_p50` | `ms` | gauge | down_good | Median end to end. |
 | `usage.latency_p95` | `ms` | gauge | down_good | p95 end to end. |
 | `usage.latency_p99` | `ms` | gauge | down_good | p99 end to end. |
@@ -377,7 +429,7 @@ style choice — `cost.total` with `direction: up_good` paints rising spend gree
 
 | id | unit | kind | direction | meaning |
 |---|---|---|---|---|
-| `uptime.window` | `ratio` | ratio | up_good | Fraction of the window up. Set `window`. |
+| `uptime.window` | `ratio` | gauge | up_good | Fraction of the window up. Set `window`. |
 | `uptime.outage_seconds` | `seconds` | counter | down_good | Time down in the window. |
 | `incidents.open` | `count` | gauge | down_good | Open and unresolved. |
 | `errors.count` | `count` | counter | down_good | Errors in the window. |
@@ -385,7 +437,7 @@ style choice — `cost.total` with `direction: up_good` paints rising spend gree
 | `jobs.late` | `count` | gauge | down_good | Scheduled jobs past due. |
 | `jobs.failed` | `count` | counter | down_good | Job runs that failed in the window. |
 | `ci.failed_runs` | `count` | counter | down_good | CI runs that failed in the window. |
-| `ci.pass_rate` | `ratio` | ratio | up_good | Passed ÷ total runs. |
+| `ci.pass_rate` | `ratio` | gauge | up_good | Passed ÷ total runs. |
 
 **Machines** — scope with `host`, `service`, and `instance`. This is where a
 leak, a full disk, or a saturated NIC shows up.
@@ -457,7 +509,7 @@ cardinality is unbounded, and this document has a 1000-metric cap.
 | `cost.spend` | `usd_cents` | counter | down_good | Spend attributable to one label. Scope with `service`, `host`, `job`, or `vendor`, and give it a display `label`. |
 | `cost.per_unit` | `usd_cents` | gauge | down_good | `cost.total` ÷ `usage.units`. |
 | `cost.per_user` | `usd_cents` | gauge | down_good | `cost.total` ÷ active users. |
-| `margin.gross` | `ratio` | ratio | up_good | (net revenue − cost) ÷ net revenue. Set `signed: true`. |
+| `margin.gross` | `ratio` | gauge | up_good | (net revenue − cost) ÷ net revenue. Set `signed: true`. |
 | `vendors.at_risk` | `count` | gauge | down_good | Accounts projected to hit zero before a reset, a renewal, or a working auto top-up refills them. |
 | `vendors.topup_failed` | `count` | gauge | down_good | Accounts on auto top-up whose payment method is not `ok`, or whose last top-up failed. |
 | `finance.cash` | `usd_cents` | gauge | up_good | Total across `accounts[]`. |
@@ -479,7 +531,7 @@ with a `note` beats an omission, and no breakdown at all is fine.
 | id | unit | kind | direction | meaning |
 |---|---|---|---|---|
 | `funnel.count` | `count` | gauge | up_good | People who reached this stage. Scope with `stage`, and with `source` for the cross-tab. |
-| `funnel.conversion` | `ratio` | ratio | up_good | Reached this stage ÷ reached the one before it. |
+| `funnel.conversion` | `ratio` | gauge | up_good | Reached this stage ÷ reached the one before it. |
 | `funnel.time_to_convert_p50` | `seconds` | gauge | down_good | Median time to get from the previous stage to this one. |
 | `acquisition.cac` | `usd_cents` | gauge | down_good | Spend on a source ÷ paying customers it produced. |
 | `acquisition.ltv` | `usd_cents` | gauge | up_good | Net revenue expected from a customer, by source. |
@@ -519,8 +571,10 @@ registry is expected of anyone.
 - **`ratio` is 0–1, `percent` is 0–100.** Never mix. A "94" that might be 94% or
   9400% is a metric nobody trusts. The ceiling catches a percent posted into a
   ratio field, which would otherwise render as 8710%.
-- **`signed: true`** relaxes the ratio floor. Gross margin goes below zero and
-  most pre-launch months are there; rejecting it hides the months you most want.
+- **`signed: true`** relaxes the ratio floor, and only that. Gross margin goes
+  below zero and most pre-launch months are there; rejecting it hides the months
+  you most want. Every other unit may go negative without it — net burn is
+  negative in a good month.
 - **`unit: "other"` requires `unitLabel`** — short, like `"°C"` or `"jobs/hr"`.
 - **`null` is "not available"**, which is not zero. Never send zero for missing.
 
@@ -848,7 +902,8 @@ roll-ups are metrics.
   "connection": "read_only",         // REQUIRED. read_only | manual | none
   "role": "operating",               // operating | tax | payouts | reserve
   "currency": "usd",                 // REQUIRED
-  "balanceCents": 4821900,           // REQUIRED
+  "balanceCents": 4821900,           // REQUIRED. denominated in `currency`
+  "usdCents": null,                  // REQUIRED when `currency` is not usd
   "availableCents": 4712300,         // minus holds and pending debits
   "pendingInCents": 312400,          // settling toward this account
   "pendingOutCents": 109600,         // authorised, not yet settled
@@ -875,6 +930,12 @@ roll-ups are metrics.
   and every finding here is an aggregate anyway.
 - `manual` is a legitimate connection. A balance typed in weekly with an honest
   `asOf` still answers "how much runway is there".
+- **One currency in the roll-ups.** `balanceCents` is in the account's own
+  currency; anything that is not `usd` also carries `usdCents`, converted, with
+  the rate's source in `note`. `finance.cash` sums `usdCents` where present and
+  `balanceCents` otherwise. An account with neither is left out of the total and
+  named in `unavailable[]` — adding euro cents to dollar cents is a number that
+  looks right and is not.
 
 ### Reconciliation is the point
 
@@ -1017,6 +1078,10 @@ Traffic is metrics scoped with `api` (§6.1):
   arguably yours. Note the convention on the surface row.
 - A surface row's own metrics are that surface's total. Emit them or emit the
   operations, not both, or the totals double.
+- **The metric cap binds before the api cap.** 500 operations reporting both
+  outcomes is the entire 1000-metric budget (§26) and leaves room for nothing
+  else. Past a couple of hundred operations, report the surfaces and the
+  operations that earn their row.
 - **No per-route instrumentation? Report the surfaces.** Per-operation counts
   are where the value is, but they usually mean new middleware. A gateway that
   only knows its own total is still worth reporting: emit the surface rows, skip
@@ -1072,10 +1137,10 @@ the declared range.
 
 ```jsonc
 {
-  "component": "api",                    // REQUIRED. stable
+  "id": "api",                           // REQUIRED. stable
   "env": "prod",                         // REQUIRED
   "repo": "acme/api",                    // REQUIRED. owner/name
-  "status": "healthy",                   // healthy | degraded | failed
+  "status": "up",                        // up | degraded | down
                                          // | deploying | unknown
   "service": "api",
   "ref": "main",
@@ -1110,7 +1175,7 @@ Everything a human would want told about after the fact. Only items after the
   "kind": "job",                   // REQUIRED. signup | payment | churn | refund
                                    // | deploy | rollback | job | scale | config
                                    // | security | vendor | support | manual | other
-  "severity": "warn",              // info | warn | critical      (default info)
+  "severity": "warn",              // ok | warn | crit            (default ok)
   "title": "Nightly ingest processed 212,418 rows",  // REQUIRED
   "service": "ingest",
   "job": "nightly-ingest",
@@ -1164,7 +1229,9 @@ identical timeouts is one bucket with `count: 1000`.
   `firstSeenAt` inside it is a regression you just shipped. Cheap to record, and
   it is the field that says which.
 - **No PII and no payloads.** `sample` carries identifiers, not bodies.
-- Cap at 100 buckets sorted by `count`, then truncate as §2 says.
+- Cap at 100 buckets sorted by `count` descending. Over the cap the tail is
+  dropped for good, not deferred: set `cursor.complete: false` and say so in
+  `unavailable[]` (§2, rule 4).
 
 ---
 
@@ -1194,6 +1261,12 @@ the `inbox` cursor.
 **Never full bodies, never attachments.** A snippet and a link are enough to
 triage, and this document is cached, logged, and written to a database on
 another machine. Mask the address; the real one is behind the link.
+
+Be clear-eyed about what is left: `fromName`, `subject`, and `snippet` are text a
+customer wrote, so a report carrying an inbox is carrying customer data, and the
+consumer's database inherits that. A business that would rather not spread it
+omits all three and keeps the queue — `inbox.unread` and `inbox.oldest_age`
+answer the question the dashboard is actually asking.
 
 ---
 
@@ -1257,7 +1330,7 @@ Runs since the `ci` cursor that did not pass. Successes are a metric
 {
   "id": "ingest-failure:source-b",       // REQUIRED. STABLE across polls
   "title": "Source B returned 0 rows for 3 consecutive runs",  // REQUIRED
-  "severity": "warn",                    // REQUIRED. info | warn | critical
+  "severity": "warn",                    // REQUIRED. ok | warn | crit
   "status": "open",                      // REQUIRED. open | acknowledged | resolved
   "openedAt": "2026-08-25T05:00:00.000Z",
   "resolvedAt": null,
@@ -1351,9 +1424,15 @@ metric so it graphs.
 ```jsonc
 "unavailable": [
   { "section": "vendors", "reason": "billing API returned 502", "at": "2026-08-26T18:03:44.000Z" },
+  { "section": "metrics", "metric": "engagement.retention_d30",
+    "reason": "cohort table rebuilding", "at": "2026-08-26T18:03:20.000Z" },
   { "section": "errors", "reason": "buffer overflowed; 1,200 oldest dropped", "at": "2026-08-26T12:00:00.000Z" }
 ]
 ```
+
+`section` is always a top-level key, because that is what the consumer keys its
+last-good values on. To name one missing number rather than a whole section, add
+`metric`.
 
 Present means the report is incomplete and says which part. The consumer shows a
 banner and keeps the last good value for those sections, marked stale. A
@@ -1372,17 +1451,17 @@ dropped buffer (§2) is declared here too.
 | `accounts` | 50 | Truncated, largest balance first. |
 | `hosts` | 50 | Truncated. |
 | `endpoints` | 100 | Truncated, `down` first. |
-| `apis` | 500 | Truncated, most-called first, surfaces before operations. |
+| `apis` | 500 | Truncated, most-called first, surfaces before operations. The metric cap bites first (§14). |
 | `sources` | 200 | Truncated, most traffic first. |
 | `funnel` | 20 | Truncated from the bottom of the funnel up. |
 | `jobs` | 100 | Truncated, not-`ok` first. |
 | `deployments` | 100 | Truncated. |
-| `events` | 500 | §2, truncation. |
-| `errors` | 100 buckets | §2, truncation, by `count` descending. |
-| `inbox` | 100 | §2, truncation. |
-| `issues` | 100 | §2, truncation. |
-| `ci` | 100 | §2, truncation. |
-| `incidents` | 100 | Truncated, `critical` first. |
+| `events` | 500 | §2, rule 4. |
+| `errors` | 100 buckets | By `count` descending, and the tail is lost (§2, rule 4). |
+| `inbox` | 100 | §2, rule 4. |
+| `issues` | 100 | §2, rule 4. |
+| `ci` | 100 | §2, rule 4. |
+| `incidents` | 100 | Truncated, `crit` first. |
 | `domains` | 200 | Truncated, soonest expiry first. |
 | `compliance` | 100 | Truncated, soonest due first. |
 | Any string | 2000 chars | Truncated. |
@@ -1391,44 +1470,76 @@ dropped buffer (§2) is declared here too.
 Sort before you truncate. Send the 100 error buckets that matter, not the 100
 the query returned first.
 
-Streams truncate with a watermark (§2, truncation) and are therefore never lossy.
-Snapshots truncate by dropping the least important rows, and are.
+Streams truncate with a watermark (§2, rule 4) and are therefore never lossy —
+except `errors`, which is ranked by `count` and drops its tail. Snapshots
+truncate by dropping the least important rows, and are lossy by design.
 
 ---
 
 ## 27. Security
 
 This document is a complete operational picture of a company behind one bearer
-token, fetched by a machine that holds the same for every other company.
+token, fetched by a machine that holds the same for every other company. Two
+controls, in this order: who may connect, then who may read.
 
-1. **Bearer token, always.** `Authorization: Bearer <token>`, minimum 32
-   characters, compared in constant time.
-2. **Fail closed when unconfigured.** No token in the environment means deny
-   every request — never "skip the check". That is the bug that ships inside a
-   container whose env file did not mount and looks healthy while wide open.
-3. **One token per business**, rotatable without coordinating across companies,
+1. **Allowlist the caller, and check it before the token.** The endpoint accepts
+   connections only from an explicit list of addresses, CIDR ranges, and
+   hostnames, and answers everything else with `403` before it reads the
+   `Authorization` header — an off-list caller must not get far enough to time
+   the comparison. There is no wildcard and no "allow all" value, and an empty,
+   missing, or unparseable list denies every request.
+
+   - **Hostnames resolve at runtime** — every 60 s, or the record's TTL if that
+     is longer — and the last good answer is cached. A dynamic-DNS name is how an
+     address on DHCP gets on the list. Resolution failure keeps serving the cached
+     set; NXDOMAIN never empties the list, and never opens it.
+   - **Match the peer address of the connection.** Trust `X-Forwarded-For` only
+     when the peer is itself on a separate trusted-proxy list, and then read
+     exactly one hop from the right. A forwarded header from an untrusted peer is
+     attacker-controlled text, and believing it bypasses this entire section in
+     one line.
+   - **Allow an IPv6 prefix, not an address.** Residential ISPs delegate a /56 or
+     /64 and rotate the low bits, so a /128 entry locks you out at the next lease.
+   - **Keep one way in that does not depend on the list** — a loopback listener
+     reached over SSH, or console access — and write it in the deployment notes.
+     The failure mode of this control is locking yourself out on the morning the
+     dashboard is the thing you need.
+   - **Log every denial with its source address.** A denial from an address you do
+     not recognise is the only place this document will ever tell you that
+     somebody found the endpoint.
+
+2. **Bearer token, always.** `Authorization: Bearer <token>`, minimum 32
+   characters, compared in constant time. Never in the query string, never in a
+   log line.
+3. **Fail closed when unconfigured.** No token in the environment, or no
+   allowlist, means deny every request — never "skip the check". That is the bug
+   that ships inside a container whose env file did not mount and looks healthy
+   while wide open.
+4. **One token per business**, rotatable without coordinating across companies,
    and separate from any credential that can spend money or write.
-4. **Network restriction on top**, wherever the deployment allows it: an
-   internal interface, a source-IP allowlist, a tunnel to a loopback listener.
-   For anything inherently internet-facing, the token is the primary control.
-   Be precise about which you actually applied.
-5. **No secrets, no bodies, no PII.** No keys, tokens, passwords, connection
+5. **TLS, or a tunnel.** Bearer tokens go over HTTPS. The one exception is a
+   listener bound to loopback and reached through SSH or a VPN, where the tunnel
+   is the transport security. Never a plaintext port on a public interface.
+6. **No secrets, no bodies, no PII.** No keys, tokens, passwords, connection
    strings, customer documents, or message bodies. No account, routing, or card
    numbers, and no transaction lists — §11 is balances and totals, and the
-   connection behind it is read-only. Mask email addresses. Error
-   samples carry identifiers, not payloads. Private repository issues stay out.
+   connection behind it is read-only. Mask email addresses, and see §19 for what
+   an inbox section does still carry and what that costs. Error samples carry
+   identifiers, not payloads. Private repository issues stay out.
    The report is cached, logged, and stored on another machine; a backup of that
    machine is a backup of everything you ever put in a report.
-6. **`Cache-Control: no-store`.**
-7. **Rate limit** to roughly 10/min. The consumer polls once a minute; more than
-   that is a bug or an intruder.
+7. **`Cache-Control: no-store`.**
+8. **Rate limit** to roughly 10/min, with `Retry-After` on every `429`. The
+   consumer polls once a minute, plus a few immediate re-polls to drain a
+   truncated stream (§2, rule 4); more than that is a bug or an intruder.
 
 ---
 
 ## 28. Versioning
 
-`spec` is `"business-report/<major>"`. Consumers accept the current major and
-the one before it.
+`spec` is `"jaw-business-report/<major>"`, the major a bare integer — this document
+is `"jaw-business-report/1"`, and that exact string is what §3 requires. Consumers
+accept the current major and the one before it.
 
 **Free within a major:** new optional fields, new registry ids, new enum values.
 Consumers ignore unknown keys and read unknown enum values as `unknown`.
@@ -1445,11 +1556,12 @@ that lies about last month.
 A checker takes a report from a file, or from a live endpoint with a token, and
 runs four passes.
 
-**1. Valid.** Required fields present, enums known, money integral, ratios in
-0–1 unless `signed`, `unitLabel` set whenever `unit` is `other`, `window` set on
-counters and drawn from §6.4, `cohort` present on every cohort-basis funnel
-stage, balance present on `prepaid` and `quota` vendors and absent on
-`postpaid` and `free`. *Errors.*
+**1. Valid.** Required fields present, enums known, ids and timestamps in the §3
+shapes, money integral, ratios in 0–1 unless `signed`, `unitLabel` set whenever
+`unit` is `other`, `window` set on counters and drawn from §6.4, `cohort` present
+on every cohort-basis funnel stage, balance present on `prepaid` and `quota`
+vendors and absent on `postpaid` and `free`, `usdCents` present on every account
+not denominated in `usd`. *Errors.*
 
 **2. Consistent.** The document agrees with itself:
 
@@ -1464,7 +1576,8 @@ stage, balance present on `prepaid` and `quota` vendors and absent on
   none of those reports `status: ok`.
 - `vendors.topup_failed` equals the accounts on `auto` whose `paymentMethod` is
   not `ok` or whose last top-up failed.
-- `finance.cash` equals the sum of `accounts[].balanceCents`.
+- `finance.cash` equals the sum of `accounts[].usdCents`, falling back to
+  `balanceCents` for accounts already in `usd`.
 - `finance.unreconciled` equals account outflow minus top-level vendor spend for
   the same period, where both are present.
 - Every account declares a `connection`, and none carries an account number or a
@@ -1482,8 +1595,11 @@ stage, balance present on `prepaid` and `quota` vendors and absent on
 - Every stream item falls after the requested cursor and at or before that
   stream's returned watermark, measured on that stream's ordering field (§2).
 - Every stream item has a stable, unique `id`.
-- No `series`, `points`, or `previous` anywhere — history is not this document's
-  job (§6).
+- No `series`, `points`, or `previous` on a metric — history is not this
+  document's job (§6). `deployments[].previous` is the one legitimate use of the
+  name, and is not history.
+- `cursor.streams` names every stream the business supports, whatever `sections`
+  asked for, and `cursor.from` is present on a first call.
 
 *Errors.* Each is a case where a UI renders something confidently wrong rather
 than visibly broken.
@@ -1492,7 +1608,7 @@ than visibly broken.
 `expected` on jobs, on `resource.processes`, and on any metric with a known
 normal range; both outcomes of `usage.requests` on every operation in `apis[]`;
 `resource.processes` and `resource.orphans` on every non-serverless host;
-`featured` metrics present but under eight; `generatedAt` recent; every service
+`featured` metrics present, at most eight; `generatedAt` recent; every service
 either has a host, inherits one, declares `serverless`, or is `kind: external`.
 *Warnings* — a business with no revenue is not a malformed business.
 
@@ -1503,14 +1619,24 @@ either has a host, inherits one, declares `serverless`, or is `kind: external`.
 - A request with **no** token and a request with a **wrong** token both get
   `401`. Schema validation never catches a fail-open endpoint; this is the only
   check that does.
+- **Allowlist.** A correct token from an address that is not on the list gets
+  `403`, and the response says nothing a `401` would not. With the allowlist
+  unset, every request gets `403`. Starting up with the dynamic-DNS hostname
+  unresolvable leaves the endpoint closed, not open.
+- Served over HTTPS, or over a loopback listener reached through a tunnel.
 - **Cursor round trip:** call once, send `cursor.streams` back immediately, and
-  confirm the second response repeats no stream item and returns watermarks that
-  are equal or later. It catches the race in §2: a producer stamping watermarks
-  from a single "now" fails it.
+  confirm the watermarks come back equal or later and no `events`, `inbox`, or
+  `ci` item repeats. `errors` and `issues` may legitimately return the same id
+  again, so compare `(id, lastSeenAt)` and `(id, updatedAt)` there (rule 3). It
+  catches the race in §2: a producer stamping watermarks from a single "now"
+  fails it.
 
-Exit non-zero on errors, zero on warnings alone, and run it in each business's
-CI. A refactor that drops a metric should fail a pull request, not quietly blank
-a chart.
+Exit non-zero on errors, zero on warnings alone. Run passes 1–3 against a fixture
+in each business's CI — a refactor that drops a metric should fail a pull request,
+not quietly blank a chart. **Pass 4 cannot run in CI**, because a hosted runner's
+egress address is not on the allowlist and never should be. Run it from the
+consumer's own machine on a schedule. A red build "fixed" by widening the
+allowlist has traded the whole of §27 for a green tick.
 
 ---
 
@@ -1534,10 +1660,11 @@ index that stopped being used.
 
 ```json
 {
-  "spec": "business-report/1",
+  "spec": "jaw-business-report/1",
 
   "cursor": {
     "requestedSince": "2026-08-26T17:04:03.114Z",
+    "from": "2026-08-26T17:04:03.114Z",
     "streams": {
       "events": "2026-08-26T18:03:58.902Z",
       "errors": "2026-08-26T18:03:59.417Z",
@@ -1591,15 +1718,15 @@ index that stopped being used.
     { "id": "engagement.dau", "label": "DAU", "value": 1840, "unit": "count", "kind": "gauge", "group": "Engagement", "direction": "up_good" },
     { "id": "engagement.wau", "label": "WAU", "value": 4210, "unit": "count", "kind": "gauge", "group": "Engagement", "direction": "up_good" },
     { "id": "engagement.mau", "label": "MAU", "value": 6104, "unit": "count", "kind": "gauge", "group": "Engagement", "direction": "up_good" },
-    { "id": "engagement.stickiness", "label": "DAU/MAU", "value": 0.301, "unit": "ratio", "kind": "ratio", "group": "Engagement", "direction": "up_good" },
+    { "id": "engagement.stickiness", "label": "DAU/MAU", "value": 0.301, "unit": "ratio", "kind": "gauge", "group": "Engagement", "direction": "up_good" },
     { "id": "engagement.sessions_per_user", "label": "Sessions per user", "value": 3.2, "unit": "count", "kind": "gauge", "window": "7d", "group": "Engagement", "direction": "up_good" },
     { "id": "engagement.actions_per_user", "label": "API calls per active user", "value": 148.4, "unit": "count", "kind": "gauge", "window": "7d", "group": "Engagement", "direction": "up_good" },
     { "id": "engagement.session_seconds_p50", "label": "Median session", "value": 412, "unit": "seconds", "kind": "gauge", "window": "7d", "group": "Engagement", "direction": "up_good" },
-    { "id": "engagement.retention_d30", "label": "D30 retention", "value": null, "unit": "ratio", "kind": "ratio", "group": "Engagement", "direction": "up_good", "note": "Cohort table is rebuilding; not available this hour." },
+    { "id": "engagement.retention_d30", "label": "D30 retention", "value": null, "unit": "ratio", "kind": "gauge", "group": "Engagement", "direction": "up_good", "note": "Cohort table is rebuilding; not available this hour." },
 
     { "id": "usage.requests", "label": "API requests", "value": 41484, "unit": "count", "kind": "counter", "window": "1h", "service": "api", "group": "Usage", "direction": "up_good", "note": "All surfaces. The per-operation breakdown is scoped by api." },
-    { "id": "usage.success_rate", "label": "API success rate", "value": 0.9961, "unit": "ratio", "kind": "ratio", "window": "1h", "service": "api", "group": "Usage", "direction": "up_good" },
-    { "id": "usage.error_rate", "label": "API error rate", "value": 0.0039, "unit": "ratio", "kind": "ratio", "window": "1h", "service": "api", "group": "Usage", "direction": "down_good" },
+    { "id": "usage.success_rate", "label": "API success rate", "value": 0.9961, "unit": "ratio", "kind": "gauge", "window": "1h", "service": "api", "group": "Usage", "direction": "up_good" },
+    { "id": "usage.error_rate", "label": "API error rate", "value": 0.0039, "unit": "ratio", "kind": "gauge", "window": "1h", "service": "api", "group": "Usage", "direction": "down_good" },
     { "id": "usage.latency_p50", "label": "API p50", "value": 84, "unit": "ms", "kind": "gauge", "window": "5m", "service": "api", "group": "Usage", "direction": "down_good" },
     { "id": "usage.latency_p95", "label": "API p95", "value": 412, "unit": "ms", "kind": "gauge", "window": "5m", "service": "api", "group": "Usage", "direction": "down_good", "target": 300, "expected": { "min": 80, "max": 600 }, "featured": true },
     { "id": "usage.latency_p99", "label": "API p99", "value": 1210, "unit": "ms", "kind": "gauge", "window": "5m", "service": "api", "group": "Usage", "direction": "down_good" },
@@ -1618,16 +1745,16 @@ index that stopped being used.
     { "id": "queue.oldest_age", "label": "Oldest queued item", "value": 92, "unit": "seconds", "kind": "gauge", "service": "queue", "group": "Reliability", "direction": "down_good" },
     { "id": "queue.dlq_depth", "label": "Dead letters", "value": 12, "unit": "count", "kind": "gauge", "service": "queue", "group": "Reliability", "direction": "down_good" },
 
-    { "id": "uptime.window", "label": "API uptime", "value": 0.9993, "unit": "ratio", "kind": "ratio", "window": "30d", "service": "api", "group": "Reliability", "direction": "up_good", "featured": true },
+    { "id": "uptime.window", "label": "API uptime", "value": 0.9993, "unit": "ratio", "kind": "gauge", "window": "30d", "service": "api", "group": "Reliability", "direction": "up_good", "featured": true },
     { "id": "uptime.outage_seconds", "label": "API downtime", "value": 1814, "unit": "seconds", "kind": "counter", "window": "30d", "service": "api", "group": "Reliability", "direction": "down_good" },
-    { "id": "uptime.window", "label": "Marketing site uptime", "value": 0.9998, "unit": "ratio", "kind": "ratio", "window": "30d", "endpoint": "www", "group": "Reliability", "direction": "up_good" },
+    { "id": "uptime.window", "label": "Marketing site uptime", "value": 0.9998, "unit": "ratio", "kind": "gauge", "window": "30d", "endpoint": "www", "group": "Reliability", "direction": "up_good" },
     { "id": "incidents.open", "label": "Open incidents", "value": 2, "unit": "count", "kind": "gauge", "group": "Reliability", "direction": "down_good" },
     { "id": "errors.count", "label": "Errors", "value": 596, "unit": "count", "kind": "counter", "window": "1h", "group": "Reliability", "direction": "down_good" },
     { "id": "errors.buckets", "label": "Distinct errors", "value": 3, "unit": "count", "kind": "gauge", "window": "1h", "group": "Reliability", "direction": "down_good" },
     { "id": "jobs.late", "label": "Late jobs", "value": 1, "unit": "count", "kind": "gauge", "group": "Jobs", "direction": "down_good" },
     { "id": "jobs.failed", "label": "Failed job runs", "value": 0, "unit": "count", "kind": "counter", "window": "24h", "group": "Jobs", "direction": "down_good" },
     { "id": "ci.failed_runs", "label": "Failed CI runs", "value": 1, "unit": "count", "kind": "counter", "window": "24h", "group": "Code", "direction": "down_good" },
-    { "id": "ci.pass_rate", "label": "CI pass rate", "value": 0.92, "unit": "ratio", "kind": "ratio", "window": "7d", "group": "Code", "direction": "up_good" },
+    { "id": "ci.pass_rate", "label": "CI pass rate", "value": 0.92, "unit": "ratio", "kind": "gauge", "window": "7d", "group": "Code", "direction": "up_good" },
 
     { "id": "db.reads_per_request", "label": "DB reads per API request", "value": 41.2, "unit": "count", "kind": "gauge", "window": "5m", "service": "postgres", "group": "Data", "direction": "down_good", "expected": { "min": 8, "max": 18 }, "severity": "crit", "note": "Was 12 before web 2.8.0 shipped at 17:31. Same traffic, three times the reads." },
     { "id": "db.rows", "label": "users rows", "value": 18422, "unit": "count", "kind": "gauge", "service": "postgres", "instance": "users", "group": "Data", "direction": "neutral" },
@@ -1668,7 +1795,7 @@ index that stopped being used.
     { "id": "cost.total", "label": "Spend", "value": 191400, "unit": "usd_cents", "kind": "counter", "window": "30d", "group": "Cost", "direction": "down_good", "expected": { "min": 150000, "max": 210000 }, "featured": true },
     { "id": "cost.per_unit", "label": "Cost per credit", "value": 15, "unit": "usd_cents", "kind": "gauge", "window": "30d", "group": "Cost", "direction": "down_good" },
     { "id": "cost.per_user", "label": "Cost per active user", "value": 31, "unit": "usd_cents", "kind": "gauge", "window": "30d", "group": "Cost", "direction": "down_good" },
-    { "id": "margin.gross", "label": "Gross margin", "value": 0.9594, "unit": "ratio", "kind": "ratio", "window": "30d", "group": "Cost", "direction": "up_good", "signed": true },
+    { "id": "margin.gross", "label": "Gross margin", "value": 0.9594, "unit": "ratio", "kind": "gauge", "window": "30d", "group": "Cost", "direction": "up_good", "signed": true },
     { "id": "vendors.at_risk", "label": "Accounts running out", "value": 1, "unit": "count", "kind": "gauge", "group": "Cost", "direction": "down_good", "note": "The proxy account, which is manual. The LLM account also hits zero this week but tops itself up." },
     { "id": "vendors.topup_failed", "label": "Auto top-ups at risk", "value": 0, "unit": "count", "kind": "gauge", "group": "Cost", "direction": "down_good", "expected": { "min": 0, "max": 0 } },
     { "id": "finance.cash", "label": "Cash on hand", "value": 6974300, "unit": "usd_cents", "kind": "gauge", "group": "Finance", "direction": "up_good", "featured": true },
@@ -1685,7 +1812,7 @@ index that stopped being used.
 
     { "id": "acme.solve.attempts", "label": "Solves — succeeded", "value": 41022, "unit": "count", "kind": "counter", "window": "1h", "service": "inference", "outcome": "success", "group": "Product", "direction": "up_good" },
     { "id": "acme.solve.attempts", "label": "Solves — failed", "value": 178, "unit": "count", "kind": "counter", "window": "1h", "service": "inference", "outcome": "failure", "group": "Product", "direction": "down_good", "expected": { "min": 0, "max": 400 } },
-    { "id": "acme.model.accuracy", "label": "Model accuracy", "value": 0.941, "unit": "ratio", "kind": "ratio", "window": "24h", "service": "inference", "group": "Product", "direction": "up_good", "target": 0.95 },
+    { "id": "acme.model.accuracy", "label": "Model accuracy", "value": 0.941, "unit": "ratio", "kind": "gauge", "window": "24h", "service": "inference", "group": "Product", "direction": "up_good", "target": 0.95 },
 
     { "id": "funnel.count", "label": "Search impressions", "value": 412000, "unit": "count", "kind": "gauge", "window": "30d", "stage": "impression", "group": "Funnel", "direction": "up_good" },
     { "id": "funnel.count", "label": "Visits", "value": 18400, "unit": "count", "kind": "gauge", "window": "30d", "stage": "visit", "group": "Funnel", "direction": "up_good", "featured": true },
@@ -1694,11 +1821,11 @@ index that stopped being used.
     { "id": "funnel.count", "label": "Using it weekly", "value": 604, "unit": "count", "kind": "gauge", "stage": "active", "group": "Funnel", "direction": "up_good" },
     { "id": "funnel.count", "label": "Converted to paid", "value": 96, "unit": "count", "kind": "gauge", "stage": "paid", "group": "Funnel", "direction": "up_good" },
 
-    { "id": "funnel.conversion", "label": "Impression → visit", "value": 0.0447, "unit": "ratio", "kind": "ratio", "stage": "visit", "group": "Funnel", "direction": "up_good", "note": "Two populations, not a conversion — both stages are window basis." },
-    { "id": "funnel.conversion", "label": "Visit → signup", "value": 0.0674, "unit": "ratio", "kind": "ratio", "stage": "signup", "group": "Funnel", "direction": "up_good", "note": "Crosses the window/cohort boundary. Read as an estimate." },
-    { "id": "funnel.conversion", "label": "Signup → onboarded", "value": 0.6548, "unit": "ratio", "kind": "ratio", "stage": "onboarded", "group": "Funnel", "direction": "up_good", "expected": { "min": 0.6, "max": 0.8 } },
-    { "id": "funnel.conversion", "label": "Onboarded → weekly", "value": 0.7438, "unit": "ratio", "kind": "ratio", "stage": "active", "group": "Funnel", "direction": "up_good" },
-    { "id": "funnel.conversion", "label": "Weekly → paid", "value": 0.1589, "unit": "ratio", "kind": "ratio", "stage": "paid", "group": "Funnel", "direction": "up_good", "target": 0.2, "featured": true },
+    { "id": "funnel.conversion", "label": "Impression → visit", "value": 0.0447, "unit": "ratio", "kind": "gauge", "stage": "visit", "group": "Funnel", "direction": "up_good", "note": "Two populations, not a conversion — both stages are window basis." },
+    { "id": "funnel.conversion", "label": "Visit → signup", "value": 0.0674, "unit": "ratio", "kind": "gauge", "stage": "signup", "group": "Funnel", "direction": "up_good", "note": "Crosses the window/cohort boundary. Read as an estimate." },
+    { "id": "funnel.conversion", "label": "Signup → onboarded", "value": 0.6548, "unit": "ratio", "kind": "gauge", "stage": "onboarded", "group": "Funnel", "direction": "up_good", "expected": { "min": 0.6, "max": 0.8 } },
+    { "id": "funnel.conversion", "label": "Onboarded → weekly", "value": 0.7438, "unit": "ratio", "kind": "gauge", "stage": "active", "group": "Funnel", "direction": "up_good" },
+    { "id": "funnel.conversion", "label": "Weekly → paid", "value": 0.1589, "unit": "ratio", "kind": "gauge", "stage": "paid", "group": "Funnel", "direction": "up_good", "target": 0.2, "featured": true },
     { "id": "funnel.time_to_convert_p50", "label": "Signup → onboarded, median", "value": 420, "unit": "seconds", "kind": "gauge", "stage": "onboarded", "group": "Funnel", "direction": "down_good" },
     { "id": "funnel.time_to_convert_p50", "label": "Weekly → paid, median", "value": 950400, "unit": "seconds", "kind": "gauge", "stage": "paid", "group": "Funnel", "direction": "down_good", "note": "11 days, so the 30-day cohort is mature enough to read." },
 
@@ -1719,7 +1846,7 @@ index that stopped being used.
 
     { "id": "usage.requests", "label": "POST /v1/solve — succeeded", "value": 34042, "unit": "count", "kind": "counter", "window": "1h", "api": "api-public:POST /v1/solve", "outcome": "success", "group": "API", "direction": "up_good" },
     { "id": "usage.requests", "label": "POST /v1/solve — failed", "value": 126, "unit": "count", "kind": "counter", "window": "1h", "api": "api-public:POST /v1/solve", "outcome": "failure", "group": "API", "direction": "down_good" },
-    { "id": "usage.error_rate", "label": "POST /v1/solve error rate", "value": 0.0037, "unit": "ratio", "kind": "ratio", "window": "1h", "api": "api-public:POST /v1/solve", "group": "API", "direction": "down_good" },
+    { "id": "usage.error_rate", "label": "POST /v1/solve error rate", "value": 0.0037, "unit": "ratio", "kind": "gauge", "window": "1h", "api": "api-public:POST /v1/solve", "group": "API", "direction": "down_good" },
     { "id": "usage.latency_p95", "label": "POST /v1/solve p95", "value": 486, "unit": "ms", "kind": "gauge", "window": "5m", "api": "api-public:POST /v1/solve", "group": "API", "direction": "down_good" },
     { "id": "usage.requests", "label": "GET /v1/solve/{id} — succeeded", "value": 5102, "unit": "count", "kind": "counter", "window": "1h", "api": "api-public:GET /v1/solve/{id}", "outcome": "success", "group": "API", "direction": "up_good" },
     { "id": "usage.requests", "label": "GET /v1/solve/{id} — failed", "value": 8, "unit": "count", "kind": "counter", "window": "1h", "api": "api-public:GET /v1/solve/{id}", "outcome": "failure", "group": "API", "direction": "down_good" },
@@ -1729,7 +1856,7 @@ index that stopped being used.
     { "id": "usage.requests", "label": "DELETE /v1/account/keys/{id} — failed", "value": 0, "unit": "count", "kind": "counter", "window": "1h", "api": "api-public:DELETE /v1/account/keys/{id}", "outcome": "failure", "group": "API", "direction": "down_good" },
     { "id": "usage.requests", "label": "POST /v1/export — succeeded", "value": 0, "unit": "count", "kind": "counter", "window": "1h", "api": "api-public:POST /v1/export", "outcome": "success", "group": "API", "direction": "up_good", "severity": "crit" },
     { "id": "usage.requests", "label": "POST /v1/export — failed", "value": 18, "unit": "count", "kind": "counter", "window": "1h", "api": "api-public:POST /v1/export", "outcome": "failure", "group": "API", "direction": "down_good", "severity": "crit" },
-    { "id": "usage.error_rate", "label": "POST /v1/export error rate", "value": 1, "unit": "ratio", "kind": "ratio", "window": "1h", "api": "api-public:POST /v1/export", "group": "API", "direction": "down_good", "severity": "crit", "note": "Every call has failed since 17:05. Times out against the object store." },
+    { "id": "usage.error_rate", "label": "POST /v1/export error rate", "value": 1, "unit": "ratio", "kind": "gauge", "window": "1h", "api": "api-public:POST /v1/export", "group": "API", "direction": "down_good", "severity": "crit", "note": "Every call has failed since 17:05. Times out against the object store." },
     { "id": "usage.latency_p95", "label": "POST /v1/export p95", "value": 5012, "unit": "ms", "kind": "gauge", "window": "5m", "api": "api-public:POST /v1/export", "group": "API", "direction": "down_good", "severity": "crit" },
     { "id": "usage.requests", "label": "GET /admin/metrics — succeeded", "value": 60, "unit": "count", "kind": "counter", "window": "1h", "api": "api-admin:GET /admin/metrics", "outcome": "success", "group": "API", "direction": "up_good" },
     { "id": "usage.requests", "label": "GET /admin/metrics — failed", "value": 0, "unit": "count", "kind": "counter", "window": "1h", "api": "api-admin:GET /admin/metrics", "outcome": "failure", "group": "API", "direction": "down_good" },
@@ -1982,15 +2109,15 @@ index that stopped being used.
   ],
 
   "deployments": [
-    { "component": "api", "env": "prod", "repo": "acme/api", "status": "healthy", "service": "api",
+    { "id": "api", "env": "prod", "repo": "acme/api", "status": "up", "service": "api",
       "ref": "main", "sha": "f48f630b", "version": "1.4.2", "deployedAt": "2026-08-24T09:00:00.000Z",
       "url": "https://github.com/acme/api/releases/tag/v1.4.2",
       "previous": { "sha": "1c9a04e2", "version": "1.4.1", "deployedAt": "2026-08-19T21:04:42.000Z" } },
-    { "component": "web", "env": "prod", "repo": "acme/web", "status": "healthy", "service": "web",
+    { "id": "web", "env": "prod", "repo": "acme/web", "status": "up", "service": "web",
       "ref": "main", "sha": "7b21ca90", "version": "2.8.0", "deployedAt": "2026-08-26T17:31:44.000Z",
       "url": "https://github.com/acme/web/releases/tag/v2.8.0",
       "previous": { "sha": "004ad112", "version": "2.7.3", "deployedAt": "2026-08-21T10:02:00.000Z" } },
-    { "component": "ingest", "env": "prod", "repo": "acme/ingest", "status": "degraded", "service": "ingest",
+    { "id": "ingest", "env": "prod", "repo": "acme/ingest", "status": "degraded", "service": "ingest",
       "ref": "main", "sha": "aa19c004", "version": "0.6.1", "deployedAt": "2026-08-22T12:00:00.000Z",
       "previous": { "sha": "88c1d0aa", "version": "0.6.0", "deployedAt": "2026-08-15T08:30:00.000Z" } }
   ],
@@ -2000,7 +2127,7 @@ index that stopped being used.
       "title": "Proxy balance projected to run out in 3 days",
       "detail": "41 GB left, burning 13 GB/day. Prepaid, so it does not refill.",
       "url": "https://example.com/proxy/billing" },
-    { "id": "evt-2026-08-26-b2c3", "at": "2026-08-26T17:31:44.000Z", "kind": "deploy", "severity": "info",
+    { "id": "evt-2026-08-26-b2c3", "at": "2026-08-26T17:31:44.000Z", "kind": "deploy", "severity": "ok",
       "title": "Deployed web 2.8.0 to prod", "service": "web",
       "url": "https://github.com/acme/web/releases/tag/v2.8.0" },
     { "id": "evt-2026-08-26-c3d4", "at": "2026-08-26T17:49:10.000Z", "kind": "payment", "severity": "warn",
@@ -2115,8 +2242,8 @@ index that stopped being used.
   },
 
   "unavailable": [
-    { "section": "engagement.retention_d30", "reason": "cohort table rebuilding since 17:20",
-      "at": "2026-08-26T18:03:20.000Z" }
+    { "section": "metrics", "metric": "engagement.retention_d30",
+      "reason": "cohort table rebuilding since 17:20", "at": "2026-08-26T18:03:20.000Z" }
   ]
 }
 ```
