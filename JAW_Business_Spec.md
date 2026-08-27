@@ -154,21 +154,22 @@ the next request. It never invents a watermark from its own clock.
   "vendors":     [ … ],   // what we pay for                        §8
   "hosts":       [ … ],   // machines we are responsible for        §9
   "endpoints":   [ … ],   // URLs under health check               §10
-  "jobs":        [ … ],   // crons and batches, with normal ranges  §11
-  "deployments": [ … ],   // what is running                       §12
+  "apis":        [ … ],   // every API surface and operation       §11
+  "jobs":        [ … ],   // crons and batches, with normal ranges  §12
+  "deployments": [ … ],   // what is running                       §13
 
-  "events":    [ … ],     // stream: notable things that happened  §13
-  "errors":    [ … ],     // stream: bucketed application errors   §14
-  "inbox":     [ … ],     // stream: new customer mail             §15
-  "issues":    [ … ],     // stream: public repo issues            §16
-  "ci":        [ … ],     // stream: failed CI and test runs       §17
+  "events":    [ … ],     // stream: notable things that happened  §14
+  "errors":    [ … ],     // stream: bucketed application errors   §15
+  "inbox":     [ … ],     // stream: new customer mail             §16
+  "issues":    [ … ],     // stream: public repo issues            §17
+  "ci":        [ … ],     // stream: failed CI and test runs       §18
 
-  "incidents":  [ … ],    // open and recently resolved            §18
-  "domains":    [ … ],    // registrations and expiry              §19
-  "compliance": [ … ],    // filings, registrations, insurance     §20
+  "incidents":  [ … ],    // open and recently resolved            §19
+  "domains":    [ … ],    // registrations and expiry              §20
+  "compliance": [ … ],    // filings, registrations, insurance     §21
 
-  "extra":       { … },   // free-form                             §21
-  "unavailable": [ … ]    // sections this report could not produce §21
+  "extra":       { … },   // free-form                             §22
+  "unavailable": [ … ]    // sections this report could not produce §22
 }
 ```
 
@@ -274,6 +275,7 @@ A metric may name what it is about. All are optional; more than one may be set.
 | `vendor` | `vendors[].id` | requests billed to the LLM provider |
 | `job` | `jobs[].id` | rows processed by the nightly ingest |
 | `endpoint` | `endpoints[].id` | check latency for the health URL |
+| `api` | `apis[].id` | calls to `POST /v1/solve` |
 | `instance` | free text, within the scope above | `/data`, `gpu0`, `queue:apply` |
 | `outcome` | `success` \| `failure` | attempts that succeeded vs failed |
 
@@ -281,7 +283,7 @@ Unscoped means business-wide. `revenue.net` with no scope is the company's;
 `revenue.net` with `service: "api"` is that product line's.
 
 **Identity is the whole tuple**: `id` + `service` + `host` + `vendor` + `job` +
-`endpoint` + `instance` + `outcome`. That tuple must be unique in the document.
+`endpoint` + `api` + `instance` + `outcome`. That tuple must be unique in the document.
 Everything else — which services are busy, which are idle, which earns money,
 which leaks memory — is a group-by on the consumer's side.
 
@@ -392,16 +394,24 @@ leak, a full disk, or a saturated NIC shows up.
 | `resource.fds` | `count` | gauge | down_good | Open file descriptors. |
 | `resource.threads` | `count` | gauge | down_good | Threads or goroutines. |
 | `resource.restarts` | `count` | counter | down_good | Process restarts in the window. |
+| `resource.processes` | `count` | gauge | neutral | Live processes we manage. Scope by host or service, and set `expected` — the right number is a known number. |
+| `resource.orphans` | `count` | gauge | down_good | Processes matching a managed service that no supervisor owns: reparented to init when their parent died, or left behind by a previous release. Expected zero. |
 
 **Money out**
 
 | id | unit | kind | direction | meaning |
 |---|---|---|---|---|
 | `cost.total` | `usd_cents` | counter | down_good | All spend in the window. |
+| `cost.spend` | `usd_cents` | counter | down_good | Spend attributable to one label. Scope with `service`, `host`, `job`, or `vendor`, and give it a display `label`. |
 | `cost.per_unit` | `usd_cents` | gauge | down_good | `cost.total` ÷ `usage.units`. |
 | `cost.per_user` | `usd_cents` | gauge | down_good | `cost.total` ÷ active users. |
 | `margin.gross` | `ratio` | ratio | up_good | (net revenue − cost) ÷ net revenue. Set `signed: true`. |
 | `vendors.at_risk` | `count` | gauge | down_good | Accounts projected to hit zero before they reset or renew. |
+
+`cost.total` is everything. `cost.spend` rows are the breakdown, and there may
+be several axes — by our service, by host, by job, by vendor. **Sum within one
+label, never across.** The same dollar appears once per axis, so adding a
+by-service row to a by-host row counts it twice.
 
 **Support, code, and paperwork**
 
@@ -581,9 +591,15 @@ GPU, an annual filing fee — stay out by default; this section is for monitorin
 what is running, not for bookkeeping. A producer that wants them anyway puts
 them in `spend.lastInvoiceCents` for the period they hit and says so in `note`.
 
-**`parent` breaks a bill into line items.** One cloud provider with compute,
-storage, and egress becomes four entries: the account, and three children with
-`parent` set. Spend on a parent means unattributed spend, not the total.
+**`parent` breaks a bill into line items, and you should break it.** One
+provider with compute, functions, storage, a managed database, and egress is six
+entries: the account, and five children. A lump per provider tells you spend went
+up. Line items tell you which component did it, which is the only version of that
+fact anyone can act on — and every billing API worth using will group by
+component if you ask it to.
+
+A parent's `spend` is the whole account. Children sum to no more than the parent;
+the gap is spend the provider did not attribute.
 
 ---
 
@@ -611,6 +627,17 @@ Identity only. CPU, memory, VRAM, disk, network, sockets are metrics scoped with
 
 A host that has not reported in is `unknown`, not `down`. The consumer decides
 what a stale `lastSeenAt` means.
+
+**Count your processes.** Every non-serverless host reports
+`resource.processes` — with `expected`, because the right number is a number you
+know — and `resource.orphans`. An orphan is a process that matches a service you
+manage but that no supervisor owns: reparented to init when its parent died, or
+left running by a release that half-restarted. `resource.processes` counts
+every live process matching a managed service, orphans included;
+`resource.orphans` is the subset nobody owns. An orphan holds memory, file handles,
+and sometimes a port, it is invisible to the supervisor that would have
+restarted it, and it is the reason a machine can be at 78% memory with every
+service reporting healthy.
 
 Serverless services set `serverless: true` and report no host. That is not a
 gap — there is nothing to watch.
@@ -643,7 +670,60 @@ belongs on the thing that serves it, not in a calendar somewhere.
 
 ---
 
-## 11. `jobs` — crons and batches
+## 11. `apis` — every API surface and operation
+
+What the business exposes and how hard it is being called. One row per surface,
+one row per operation, linked by `parent` — the same nesting as services.
+
+```jsonc
+{
+  "id": "api-public:POST /v1/solve",   // REQUIRED. stable
+  "name": "Submit a solve",            // REQUIRED
+  "parent": "api-public",              // the surface this operation belongs to
+  "service": "api",                    // services[].id that serves it
+  "method": "POST",                    // REQUIRED for rest and webhook surfaces
+  "path": "/v1/solve",                 // REQUIRED. route TEMPLATE, never a real path
+  "kind": "rest",                      // rest | graphql | grpc | websocket
+                                       // | webhook | mcp | other
+  "auth": "bearer",                    // none | bearer | key | oauth | mtls | signature
+  "visibility": "public",              // public | partner | internal
+  "status": "up",                      // up | degraded | down | unknown
+  "deprecated": false,
+  "since": "2026-03-01T00:00:00.000Z",
+  "url": "https://api.acme.example/v1/solve"
+}
+```
+
+Traffic is metrics scoped with `api` (§6.1):
+
+| Metric | |
+|---|---|
+| `usage.requests` with `outcome: "success"` and `outcome: "failure"` | required for every operation |
+| `usage.latency_p50`, `usage.latency_p95`, `usage.error_rate` | where you have them |
+
+### Rules
+
+- **Route templates, never concrete paths.** `/v1/solve/{id}`, not
+  `/v1/solve/8812`. Concrete paths make cardinality unbounded and the section
+  worthless within a day.
+- **Every operation, including the ones nobody called.** A route at zero is
+  information — it is dead, it is broken, or nobody found it. Omitting it says
+  nothing; `value: 0` says something.
+- **Counts, not just a rate.** A rate cannot distinguish 1 failure in 3 from
+  40,000 in 120,000. Emit both outcomes and let the consumer divide.
+- **Define failure once and say which.** 5xx is always failure; 4xx is a
+  judgement call — a 429 you imposed and a 401 from a token you rotated are
+  arguably yours. Note the convention on the surface row.
+- A surface row's own metrics are that surface's total. Emit them or emit the
+  operations, not both, or the totals double.
+
+Most API gateways, load balancers, and cloud CLIs already report request and
+error counts grouped by route. That grouping is the one to pull — the
+account-wide total is the number you already have and cannot act on.
+
+---
+
+## 12. `jobs` — crons and batches
 
 Point-in-time state of every scheduled thing, plus the range that counts as
 normal.
@@ -683,7 +763,7 @@ still the most interesting thing that happened last night. `status:
 
 ---
 
-## 12. `deployments` — what is running
+## 13. `deployments` — what is running
 
 ```jsonc
 {
@@ -713,7 +793,7 @@ button say where it is going before you press it.
 
 ---
 
-## 13. `events` — stream: notable things that happened
+## 14. `events` — stream: notable things that happened
 
 Everything a human would want told about after the fact. Only items after the
 `events` cursor.
@@ -747,7 +827,7 @@ few hundred times a day it is a metric, not an event.
 
 ---
 
-## 14. `errors` — stream: bucketed application errors
+## 15. `errors` — stream: bucketed application errors
 
 **Grouped, never raw.** One entry per distinct failure, with a count. A thousand
 identical timeouts is one bucket with `count: 1000`.
@@ -783,7 +863,7 @@ identical timeouts is one bucket with `count: 1000`.
 
 ---
 
-## 15. `inbox` — stream: new customer mail
+## 16. `inbox` — stream: new customer mail
 
 Every support channel that receives customer messages, in one queue. Items after
 the `inbox` cursor.
@@ -812,7 +892,7 @@ another machine. Mask the address; the real one is behind the link.
 
 ---
 
-## 16. `issues` — stream: public repository issues
+## 17. `issues` — stream: public repository issues
 
 Links and titles only, and **public repositories only**. Issues opened or
 updated since the `issues` cursor.
@@ -839,7 +919,7 @@ Private repositories stay out — their titles leak roadmap and customers.
 
 ---
 
-## 17. `ci` — stream: failed builds and tests
+## 18. `ci` — stream: failed builds and tests
 
 Runs since the `ci` cursor that did not pass. Successes are a metric
 (`ci.pass_rate`), not a list.
@@ -866,7 +946,7 @@ Runs since the `ci` cursor that did not pass. Successes are a metric
 
 ---
 
-## 18. `incidents` — open and recently resolved
+## 19. `incidents` — open and recently resolved
 
 ```jsonc
 {
@@ -895,7 +975,7 @@ drop them.
 
 ---
 
-## 19. `domains`
+## 20. `domains`
 
 ```jsonc
 {
@@ -919,7 +999,7 @@ outage with a date on it. Certificates live on `endpoints[].tls` (§10).
 
 ---
 
-## 20. `compliance` — filings, registrations, insurance
+## 21. `compliance` — filings, registrations, insurance
 
 The paperwork that quietly expires: entity good standing, annual reports,
 franchise tax, registered agent, insurance, licences.
@@ -950,7 +1030,7 @@ of thing nobody remembers to check.
 
 ---
 
-## 21. `extra` and `unavailable`
+## 22. `extra` and `unavailable`
 
 ```jsonc
 "extra": {
@@ -977,7 +1057,7 @@ also where a dropped buffer (§2, rule 6) is confessed.
 
 ---
 
-## 22. Limits
+## 23. Limits
 
 | Thing | Cap | Over the cap |
 |---|---|---|
@@ -987,6 +1067,7 @@ also where a dropped buffer (§2, rule 6) is confessed.
 | `vendors` | 100 | Truncated, `crit` first. |
 | `hosts` | 50 | Truncated. |
 | `endpoints` | 100 | Truncated, `down` first. |
+| `apis` | 500 | Truncated, most-called first, surfaces before operations. |
 | `jobs` | 100 | Truncated, not-`ok` first. |
 | `deployments` | 100 | Truncated. |
 | `events` | 500 | §2 rule 4. |
@@ -1008,7 +1089,7 @@ Snapshots truncate by dropping the least important rows, and are.
 
 ---
 
-## 23. Security
+## 24. Security
 
 This document is a complete operational picture of a company behind one bearer
 token, fetched by a machine that holds the same for every other company.
@@ -1035,7 +1116,7 @@ token, fetched by a machine that holds the same for every other company.
 
 ---
 
-## 24. Versioning
+## 25. Versioning
 
 `spec` is `"business-report/<major>"`. Consumers accept the current major and
 the one before it.
@@ -1050,7 +1131,7 @@ that lies about last month.
 
 ---
 
-## 25. Conformance
+## 26. Conformance
 
 A checker takes a report from a file, or from a live endpoint with a token, and
 runs four passes.
@@ -1062,15 +1143,21 @@ counters, balance present on `prepaid` and `quota` vendors and absent on
 
 **2. Consistent.** The document agrees with itself:
 
-- Every `service`, `host`, `vendor`, `job`, `endpoint` on a metric resolves.
-- Every `services[].parent`, `vendors[].parent`, `dependsOn`, `hosts[].services`,
-  and `endpoints[].service` resolves. No parent cycles.
+- Every `service`, `host`, `vendor`, `job`, `endpoint`, `api` on a metric
+  resolves.
+- Every `services[].parent`, `vendors[].parent`, `apis[].parent`, `dependsOn`,
+  `hosts[].services`, `apis[].service`, and `endpoints[].service` resolves. No
+  parent cycles.
 - The metric identity tuple (§6.1) is unique.
 - `vendors.at_risk` equals the vendors actually projected to hit zero before
   anything refills them, and none of those reports `status: ok`.
 - `incidents.open` equals the unresolved entries in `incidents[]`.
 - `domains.expiring` and `compliance.due` agree with their lists.
 - Every `expected` has `min <= max`.
+- Where an operation reports both outcomes and `usage.error_rate`, the rate
+  matches the counts within 1% relative.
+- No single-label group of `cost.spend` exceeds `cost.total` for the same
+  window, and child vendor spend sums to no more than the parent's.
 - Every stream item falls after the requested cursor and at or before that
   stream's returned watermark, measured on that stream's ordering field (§2).
 - Every stream item has a stable, unique `id`.
@@ -1081,8 +1168,10 @@ counters, balance present on `prepaid` and `quota` vendors and absent on
 than visibly broken.
 
 **3. Complete.** Recommended registry metrics present; `direction` set;
-`expected` set on jobs and on any metric with a known normal range; `featured`
-metrics present but under eight; `generatedAt` recent; every service has a host, inherits one from a
+`expected` set on jobs, on `resource.processes`, and on any metric with a known
+normal range; every operation in `apis[]` reporting both outcomes of
+`usage.requests`; every non-serverless host reporting `resource.processes` and
+`resource.orphans`; `featured` metrics present but under eight; `generatedAt` recent; every service has a host, inherits one from a
 parent, declares `serverless`, or is `kind: external`. *Warnings* — a business with no revenue is not
 a malformed business.
 
@@ -1111,11 +1200,12 @@ service with four upstream sources, and the paperwork of a Delaware LLC. Every
 section is populated, every reference resolves, and the numbers agree with each
 other.
 
-The story it tells: source B has been dead for a day, the hourly rollup just
-processed ten times its normal volume, the worker's memory is well above its
-normal range and it has restarted twice, a GPU is over its temperature band, the
-proxy balance runs out in three days, one domain is 21 days from expiry with
-auto-renew off, and the franchise tax is due.
+The story it tells: source B has been dead for a day, `POST /v1/export` is
+failing every call, the hourly rollup just processed ten times its normal volume,
+the worker's memory is above its range with an orphaned process left over from a
+restart, a GPU is over its temperature band, the proxy balance runs out in three
+days, one domain is 21 days from expiry with auto-renew off, and the franchise
+tax is due.
 
 ```json
 {
@@ -1148,7 +1238,7 @@ auto-renew off, and the franchise tax is due.
 
   "status": {
     "level": "warn",
-    "summary": "Source B down 37h. Hourly rollup ran 10x normal. Proxy balance out in 3 days. Worker memory above range.",
+    "summary": "Source B down 37h. /v1/export failing every call. Hourly rollup ran 10x normal. Proxy balance out in 3 days. Orphaned worker on app-01.",
     "since": "2026-08-25T05:00:00.000Z"
   },
 
@@ -1182,9 +1272,9 @@ auto-renew off, and the franchise tax is due.
     { "id": "engagement.session_seconds_p50", "label": "Median session", "value": 412, "unit": "seconds", "kind": "gauge", "window": "7d", "group": "Engagement", "direction": "up_good" },
     { "id": "engagement.retention_d30", "label": "D30 retention", "value": null, "unit": "ratio", "kind": "ratio", "group": "Engagement", "direction": "up_good", "note": "Cohort table is rebuilding; not available this hour." },
 
-    { "id": "usage.requests", "label": "API requests", "value": 41200, "unit": "count", "kind": "counter", "window": "1h", "service": "api", "group": "Usage", "direction": "up_good" },
-    { "id": "usage.success_rate", "label": "API success rate", "value": 0.9963, "unit": "ratio", "kind": "ratio", "window": "1h", "service": "api", "group": "Usage", "direction": "up_good" },
-    { "id": "usage.error_rate", "label": "API error rate", "value": 0.0037, "unit": "ratio", "kind": "ratio", "window": "1h", "service": "api", "group": "Usage", "direction": "down_good" },
+    { "id": "usage.requests", "label": "API requests", "value": 41484, "unit": "count", "kind": "counter", "window": "1h", "service": "api", "group": "Usage", "direction": "up_good", "note": "All surfaces. The per-operation breakdown is scoped by api." },
+    { "id": "usage.success_rate", "label": "API success rate", "value": 0.9961, "unit": "ratio", "kind": "ratio", "window": "1h", "service": "api", "group": "Usage", "direction": "up_good" },
+    { "id": "usage.error_rate", "label": "API error rate", "value": 0.0039, "unit": "ratio", "kind": "ratio", "window": "1h", "service": "api", "group": "Usage", "direction": "down_good" },
     { "id": "usage.latency_p50", "label": "API p50", "value": 84, "unit": "ms", "kind": "gauge", "window": "5m", "service": "api", "group": "Usage", "direction": "down_good" },
     { "id": "usage.latency_p95", "label": "API p95", "value": 412, "unit": "ms", "kind": "gauge", "window": "5m", "service": "api", "group": "Usage", "direction": "down_good", "target": 300, "expected": { "min": 80, "max": 600 }, "featured": true },
     { "id": "usage.latency_p99", "label": "API p99", "value": 1210, "unit": "ms", "kind": "gauge", "window": "5m", "service": "api", "group": "Usage", "direction": "down_good" },
@@ -1250,7 +1340,39 @@ auto-renew off, and the franchise tax is due.
 
     { "id": "acme.solve.attempts", "label": "Solves — succeeded", "value": 41022, "unit": "count", "kind": "counter", "window": "1h", "service": "inference", "outcome": "success", "group": "Product", "direction": "up_good" },
     { "id": "acme.solve.attempts", "label": "Solves — failed", "value": 178, "unit": "count", "kind": "counter", "window": "1h", "service": "inference", "outcome": "failure", "group": "Product", "direction": "down_good", "expected": { "min": 0, "max": 400 } },
-    { "id": "acme.model.accuracy", "label": "Model accuracy", "value": 0.941, "unit": "ratio", "kind": "ratio", "window": "24h", "service": "inference", "group": "Product", "direction": "up_good", "target": 0.95 }
+    { "id": "acme.model.accuracy", "label": "Model accuracy", "value": 0.941, "unit": "ratio", "kind": "ratio", "window": "24h", "service": "inference", "group": "Product", "direction": "up_good", "target": 0.95 },
+
+    { "id": "usage.requests", "label": "POST /v1/solve — succeeded", "value": 34042, "unit": "count", "kind": "counter", "window": "1h", "api": "api-public:POST /v1/solve", "outcome": "success", "group": "API", "direction": "up_good" },
+    { "id": "usage.requests", "label": "POST /v1/solve — failed", "value": 126, "unit": "count", "kind": "counter", "window": "1h", "api": "api-public:POST /v1/solve", "outcome": "failure", "group": "API", "direction": "down_good" },
+    { "id": "usage.error_rate", "label": "POST /v1/solve error rate", "value": 0.0037, "unit": "ratio", "kind": "ratio", "window": "1h", "api": "api-public:POST /v1/solve", "group": "API", "direction": "down_good" },
+    { "id": "usage.latency_p95", "label": "POST /v1/solve p95", "value": 486, "unit": "ms", "kind": "gauge", "window": "5m", "api": "api-public:POST /v1/solve", "group": "API", "direction": "down_good" },
+    { "id": "usage.requests", "label": "GET /v1/solve/{id} — succeeded", "value": 5102, "unit": "count", "kind": "counter", "window": "1h", "api": "api-public:GET /v1/solve/{id}", "outcome": "success", "group": "API", "direction": "up_good" },
+    { "id": "usage.requests", "label": "GET /v1/solve/{id} — failed", "value": 8, "unit": "count", "kind": "counter", "window": "1h", "api": "api-public:GET /v1/solve/{id}", "outcome": "failure", "group": "API", "direction": "down_good" },
+    { "id": "usage.requests", "label": "GET /v1/account — succeeded", "value": 1890, "unit": "count", "kind": "counter", "window": "1h", "api": "api-public:GET /v1/account", "outcome": "success", "group": "API", "direction": "up_good" },
+    { "id": "usage.requests", "label": "GET /v1/account — failed", "value": 2, "unit": "count", "kind": "counter", "window": "1h", "api": "api-public:GET /v1/account", "outcome": "failure", "group": "API", "direction": "down_good" },
+    { "id": "usage.requests", "label": "DELETE /v1/account/keys/{id} — succeeded", "value": 12, "unit": "count", "kind": "counter", "window": "1h", "api": "api-public:DELETE /v1/account/keys/{id}", "outcome": "success", "group": "API", "direction": "up_good" },
+    { "id": "usage.requests", "label": "DELETE /v1/account/keys/{id} — failed", "value": 0, "unit": "count", "kind": "counter", "window": "1h", "api": "api-public:DELETE /v1/account/keys/{id}", "outcome": "failure", "group": "API", "direction": "down_good" },
+    { "id": "usage.requests", "label": "POST /v1/export — succeeded", "value": 0, "unit": "count", "kind": "counter", "window": "1h", "api": "api-public:POST /v1/export", "outcome": "success", "group": "API", "direction": "up_good", "severity": "crit" },
+    { "id": "usage.requests", "label": "POST /v1/export — failed", "value": 18, "unit": "count", "kind": "counter", "window": "1h", "api": "api-public:POST /v1/export", "outcome": "failure", "group": "API", "direction": "down_good", "severity": "crit" },
+    { "id": "usage.error_rate", "label": "POST /v1/export error rate", "value": 1, "unit": "ratio", "kind": "ratio", "window": "1h", "api": "api-public:POST /v1/export", "group": "API", "direction": "down_good", "severity": "crit", "note": "Every call has failed since 17:05. Times out against the object store." },
+    { "id": "usage.latency_p95", "label": "POST /v1/export p95", "value": 5012, "unit": "ms", "kind": "gauge", "window": "5m", "api": "api-public:POST /v1/export", "group": "API", "direction": "down_good", "severity": "crit" },
+    { "id": "usage.requests", "label": "GET /admin/metrics — succeeded", "value": 60, "unit": "count", "kind": "counter", "window": "1h", "api": "api-admin:GET /admin/metrics", "outcome": "success", "group": "API", "direction": "up_good" },
+    { "id": "usage.requests", "label": "GET /admin/metrics — failed", "value": 0, "unit": "count", "kind": "counter", "window": "1h", "api": "api-admin:GET /admin/metrics", "outcome": "failure", "group": "API", "direction": "down_good" },
+    { "id": "usage.requests", "label": "POST /admin/replay — succeeded", "value": 3, "unit": "count", "kind": "counter", "window": "1h", "api": "api-admin:POST /admin/replay", "outcome": "success", "group": "API", "direction": "up_good" },
+    { "id": "usage.requests", "label": "POST /admin/replay — failed", "value": 1, "unit": "count", "kind": "counter", "window": "1h", "api": "api-admin:POST /admin/replay", "outcome": "failure", "group": "API", "direction": "down_good" },
+    { "id": "usage.requests", "label": "POST /hooks/payments — succeeded", "value": 214, "unit": "count", "kind": "counter", "window": "1h", "api": "api-hooks:POST /hooks/payments", "outcome": "success", "group": "API", "direction": "up_good" },
+    { "id": "usage.requests", "label": "POST /hooks/payments — failed", "value": 6, "unit": "count", "kind": "counter", "window": "1h", "api": "api-hooks:POST /hooks/payments", "outcome": "failure", "group": "API", "direction": "down_good", "note": "Six retried deliveries from the payment processor. Same batch as the failed renewals." },
+
+    { "id": "cost.spend", "label": "Spend — API", "value": 61200, "unit": "usd_cents", "kind": "counter", "window": "30d", "service": "api", "group": "Cost", "direction": "down_good" },
+    { "id": "cost.spend", "label": "Spend — inference", "value": 84000, "unit": "usd_cents", "kind": "counter", "window": "30d", "service": "inference", "group": "Cost", "direction": "down_good" },
+    { "id": "cost.spend", "label": "Spend — ingest", "value": 34200, "unit": "usd_cents", "kind": "counter", "window": "30d", "service": "ingest", "group": "Cost", "direction": "down_good" },
+    { "id": "cost.spend", "label": "Spend — worker", "value": 12000, "unit": "usd_cents", "kind": "counter", "window": "30d", "service": "worker", "group": "Cost", "direction": "down_good" },
+
+    { "id": "resource.processes", "label": "app-01 managed processes", "value": 14, "unit": "count", "kind": "gauge", "host": "app-01", "group": "Machines", "direction": "neutral", "expected": { "min": 12, "max": 13 }, "severity": "warn", "note": "One more than the supervisor accounts for." },
+    { "id": "resource.orphans", "label": "app-01 orphaned processes", "value": 1, "unit": "count", "kind": "gauge", "host": "app-01", "group": "Machines", "direction": "down_good", "expected": { "min": 0, "max": 0 }, "severity": "warn", "note": "A worker from the 09:12 restart, reparented to init. Still holding 1.1 GB and a queue connection." },
+    { "id": "resource.processes", "label": "Worker processes", "value": 4, "unit": "count", "kind": "gauge", "service": "worker", "host": "app-01", "group": "Machines", "direction": "neutral", "expected": { "min": 3, "max": 3 }, "severity": "warn" },
+    { "id": "resource.processes", "label": "gpu-01 managed processes", "value": 4, "unit": "count", "kind": "gauge", "host": "gpu-01", "group": "Machines", "direction": "neutral", "expected": { "min": 3, "max": 5 } },
+    { "id": "resource.orphans", "label": "gpu-01 orphaned processes", "value": 0, "unit": "count", "kind": "gauge", "host": "gpu-01", "group": "Machines", "direction": "down_good", "expected": { "min": 0, "max": 0 } }
   ],
 
   "services": [
@@ -1277,12 +1399,18 @@ auto-renew off, and the franchise tax is due.
       "plan": { "name": "On demand", "cents": null, "interval": "none" },
       "spend": { "periodToDateCents": 98200, "projectedPeriodCents": 118000, "lastInvoiceCents": 112400, "asOf": "2026-08-26T06:00:00.000Z" },
       "accountUrl": "https://example.com/billing", "asOf": "2026-08-26T18:03:40.000Z" },
-    { "id": "cloud.compute", "name": "Cloud — compute", "billing": "postpaid", "status": "ok", "category": "compute", "parent": "cloud",
+    { "id": "cloud.compute", "name": "Cloud — compute instances", "billing": "postpaid", "status": "ok", "category": "compute", "parent": "cloud",
       "period": { "start": "2026-08-01T00:00:00.000Z", "end": "2026-08-31T23:59:59.000Z" },
-      "spend": { "periodToDateCents": 61000, "asOf": "2026-08-26T06:00:00.000Z" } },
-    { "id": "cloud.storage", "name": "Cloud — storage", "billing": "postpaid", "status": "ok", "category": "storage", "parent": "cloud",
+      "spend": { "periodToDateCents": 42000, "asOf": "2026-08-26T06:00:00.000Z" } },
+    { "id": "cloud.functions", "name": "Cloud — functions", "billing": "postpaid", "status": "ok", "category": "compute", "parent": "cloud",
+      "period": { "start": "2026-08-01T00:00:00.000Z", "end": "2026-08-31T23:59:59.000Z" },
+      "spend": { "periodToDateCents": 9200, "asOf": "2026-08-26T06:00:00.000Z" } },
+    { "id": "cloud.storage", "name": "Cloud — object storage", "billing": "postpaid", "status": "ok", "category": "storage", "parent": "cloud",
       "period": { "start": "2026-08-01T00:00:00.000Z", "end": "2026-08-31T23:59:59.000Z" },
       "spend": { "periodToDateCents": 21400, "asOf": "2026-08-26T06:00:00.000Z" } },
+    { "id": "cloud.database", "name": "Cloud — managed database", "billing": "postpaid", "status": "ok", "category": "storage", "parent": "cloud",
+      "period": { "start": "2026-08-01T00:00:00.000Z", "end": "2026-08-31T23:59:59.000Z" },
+      "spend": { "periodToDateCents": 9800, "asOf": "2026-08-26T06:00:00.000Z" } },
     { "id": "cloud.egress", "name": "Cloud — egress", "billing": "postpaid", "status": "warn", "category": "network", "parent": "cloud",
       "period": { "start": "2026-08-01T00:00:00.000Z", "end": "2026-08-31T23:59:59.000Z" },
       "spend": { "periodToDateCents": 15800, "projectedPeriodCents": 19000, "asOf": "2026-08-26T06:00:00.000Z" },
@@ -1353,6 +1481,43 @@ auto-renew off, and the franchise tax is due.
     { "id": "docs", "url": "https://docs.acme.example", "status": "degraded", "service": "web",
       "checkedAt": "2026-08-26T18:03:55.000Z", "statusCode": 200, "latencyMs": 3120, "from": "us-west", "expectStatus": 200,
       "tls": { "expiresAt": "2026-11-02T00:00:00.000Z", "issuer": "Example CA", "daysRemaining": 68 } }
+  ],
+
+  "apis": [
+    { "id": "api-public", "name": "Public API", "service": "api", "kind": "rest", "auth": "bearer",
+      "visibility": "public", "status": "degraded", "url": "https://api.acme.example",
+      "note": "Failure = 5xx, plus 429s we imposed. 4xx from caller mistakes are not counted." },
+    { "id": "api-public:POST /v1/solve", "name": "Submit a solve", "parent": "api-public", "service": "api",
+      "method": "POST", "path": "/v1/solve", "kind": "rest", "auth": "bearer", "visibility": "public",
+      "status": "up", "deprecated": false, "since": "2026-03-01T00:00:00.000Z" },
+    { "id": "api-public:GET /v1/solve/{id}", "name": "Fetch a solve", "parent": "api-public", "service": "api",
+      "method": "GET", "path": "/v1/solve/{id}", "kind": "rest", "auth": "bearer", "visibility": "public",
+      "status": "up", "deprecated": false, "since": "2026-03-01T00:00:00.000Z" },
+    { "id": "api-public:GET /v1/account", "name": "Account and balance", "parent": "api-public", "service": "api",
+      "method": "GET", "path": "/v1/account", "kind": "rest", "auth": "bearer", "visibility": "public",
+      "status": "up", "deprecated": false, "since": "2026-03-01T00:00:00.000Z" },
+    { "id": "api-public:DELETE /v1/account/keys/{id}", "name": "Revoke an API key", "parent": "api-public",
+      "service": "api", "method": "DELETE", "path": "/v1/account/keys/{id}", "kind": "rest", "auth": "bearer",
+      "visibility": "public", "status": "up", "deprecated": false, "since": "2026-05-14T00:00:00.000Z" },
+    { "id": "api-public:POST /v1/export", "name": "Export results", "parent": "api-public", "service": "api",
+      "method": "POST", "path": "/v1/export", "kind": "rest", "auth": "bearer", "visibility": "public",
+      "status": "down", "deprecated": false, "since": "2026-07-20T00:00:00.000Z",
+      "note": "Every call has failed since 17:05." },
+
+    { "id": "api-admin", "name": "Admin API", "service": "api", "kind": "rest", "auth": "mtls",
+      "visibility": "internal", "status": "up" },
+    { "id": "api-admin:GET /admin/metrics", "name": "Internal metrics", "parent": "api-admin", "service": "api",
+      "method": "GET", "path": "/admin/metrics", "kind": "rest", "auth": "mtls", "visibility": "internal",
+      "status": "up" },
+    { "id": "api-admin:POST /admin/replay", "name": "Replay a job", "parent": "api-admin", "service": "api",
+      "method": "POST", "path": "/admin/replay", "kind": "rest", "auth": "mtls", "visibility": "internal",
+      "status": "up" },
+
+    { "id": "api-hooks", "name": "Webhook receiver", "service": "api", "kind": "webhook", "auth": "signature",
+      "visibility": "partner", "status": "up" },
+    { "id": "api-hooks:POST /hooks/payments", "name": "Payment processor callbacks", "parent": "api-hooks",
+      "service": "api", "method": "POST", "path": "/hooks/payments", "kind": "webhook", "auth": "signature",
+      "visibility": "partner", "status": "up" }
   ],
 
   "jobs": [
