@@ -1,4 +1,4 @@
-# Business Report — `business-report/1`
+# JAW Business Reporting Spec — `JAW_Business_Spec/v1`
 
 One authenticated endpoint per business. One JSON document. One shape, whatever
 the business does.
@@ -137,13 +137,20 @@ the next request. It never invents a watermark from its own clock.
    oldest, and say so in `unavailable[]`. A silent gap is the one failure this
    design is trying to prevent.
 
+**Most producers need no buffer.** If a stream is durably stored and queryable
+by timestamp — rows in a table, events in an index — answer from the query and
+ignore rules 5 and 6 entirely. Buffers exist only for things held in memory. A
+producer that cannot keep state between requests at all, such as a serverless
+function, has no buffer available and must therefore persist its streams
+somewhere it can query by time.
+
 ---
 
 ## 3. Document shape
 
 ```jsonc
 {
-  "spec": "business-report/1",  // REQUIRED, exact string
+  "spec": "JAW_Business_Spec/v1",  // REQUIRED, exact string
   "cursor":   { … },            // REQUIRED
   "business": { … },            // REQUIRED
   "status":   { … },            // REQUIRED
@@ -174,6 +181,13 @@ the next request. It never invents a watermark from its own clock.
 
 Four required fields. Everything else is optional, so a business can ship a
 conforming report in an afternoon and grow it.
+
+**Where a number comes from is not this document's business.** A live query, a
+nightly cron, a hand-maintained YAML — all legitimate. `asOf` is what tells the
+consumer how far to trust it. A renewal date typed in by hand with an honest
+`asOf` is worth more than an omitted section, and most businesses will hand-
+maintain their vendor plans, domains, and filings for a long time before any of
+it has an API behind it.
 
 Unknown top-level keys are ignored, not rejected. Unknown enum values are read
 as `"unknown"`.
@@ -258,7 +272,9 @@ does not need to serve it — the consumer will have the same curve within a day
 **`expected` is how anomalies get caught.** The producer knows what normal looks
 like; the consumer does not, on day one. A cron that normally moves 20,000 rows
 declares `expected: {min: 15000, max: 25000}`, and 212,000 is then a fact the
-dashboard can act on rather than a number a human has to recognize.
+dashboard can act on rather than a number a human has to recognize. Omit it and
+the consumer learns the band from its own history; declare it when you already
+know it, or when day-one alerting matters more than a week of watching.
 
 **`direction`** tells the UI whether green is up or down. Revenue up is good,
 cost up is bad, latency up is bad. Set it on everything.
@@ -412,6 +428,10 @@ be several axes — by our service, by host, by job, by vendor. **Sum within one
 label, never across.** The same dollar appears once per axis, so adding a
 by-service row to a by-host row counts it twice.
 
+The vendor axis is usually free — bills arrive itemized. Attributing spend to
+your *own* services generally needs resource tagging you may not have, so an
+estimate with a `note` beats an omission, and no breakdown at all is fine.
+
 **Support, code, and paperwork**
 
 | id | unit | kind | direction | meaning |
@@ -423,10 +443,20 @@ by-service row to a by-host row counts it twice.
 | `domains.expiring` | `count` | gauge | down_good | Domains with status `expiring` or `expired`, plus endpoints whose TLS certificate has 30 days or less left. |
 | `compliance.due` | `count` | gauge | down_good | Entries in `compliance[]` with status `due` or `overdue`. |
 
-Nothing is required. A pre-revenue business reports users and usage and skips
-the money rows; a checker says "missing recommended", not "invalid". A prepaid
-business has no `revenue.mrr`, and a dismissed warning beats a fabricated number
-that makes the cross-company chart lie.
+#### Recommended
+
+Five ids, and only these five, are what a checker warns about when they are
+missing:
+
+`users.total` · `usage.requests` · `usage.success_rate` · `incidents.open` ·
+`cost.total`
+
+The list is short deliberately. **Missing is a warning, not a failure**, and
+several businesses will dismiss several of them permanently: a business with no
+cost API cannot report `cost.total`, one with no analytics cannot count active
+users, a prepaid business has no `revenue.mrr`. That is the intended outcome — a
+warning you have read and dismissed beats a fabricated number that makes the
+cross-company chart lie. Nothing else in the registry is expected of anyone.
 
 ### 6.3 Units
 
@@ -442,6 +472,21 @@ that makes the cross-company chart lie.
   most pre-launch months are there; rejecting it hides the months you most want.
 - **`unit: "other"` requires `unitLabel`** — short, like `"°C"` or `"jobs/hr"`.
 - **`null` is "not available"**, which is not zero. Never send zero for missing.
+
+### 6.4 Windows
+
+`5m`, `1h`, `24h`, `7d`, `30d`, `90d`, `mtd` (month to date), `all` (since the
+business began).
+
+**`all` is the honest answer when a business holds only a lifetime figure** — a
+user table with no signup date, a lifetime-spend column with no ledger behind
+it. Report the lifetime total with `window: "all"` and let the consumer
+difference its own snapshots into a rate. A 30-day number derived from a
+lifetime total is fabricated, and it lands on the one chart that has to be
+trusted.
+
+`mtd` is what most billing APIs actually give you, so it is what most cost
+figures should carry. Do not convert it to `30d` by arithmetic.
 
 ---
 
@@ -632,6 +677,11 @@ half-restarted. It holds memory, file handles, and sometimes a port, and the
 supervisor that would restart it cannot see it — which is how a machine sits at
 78% memory with every service reporting healthy.
 
+On a container platform, ask the orchestrator the same question: a task or pod
+running that no current deployment accounts for. If there is no supervisor to
+compare against, report `resource.processes` and omit orphans rather than
+guessing at one.
+
 Serverless services set `serverless: true` and report no host. That is not a
 gap — there is nothing to watch.
 
@@ -709,6 +759,10 @@ Traffic is metrics scoped with `api` (§6.1):
   arguably yours. Note the convention on the surface row.
 - A surface row's own metrics are that surface's total. Emit them or emit the
   operations, not both, or the totals double.
+- **No per-route instrumentation? Report the surfaces.** Per-operation counts
+  are where the value is, but they usually mean new middleware. A gateway that
+  only knows its own total is still worth reporting: emit the surface rows, skip
+  the operations, and add them when the counters exist.
 
 Most gateways, load balancers, and cloud CLIs already report request and error
 counts grouped by route. Pull that grouping — the account-wide total is the
@@ -1130,7 +1184,7 @@ runs four passes.
 
 **1. Valid.** Required fields present, enums known, money integral, ratios in
 0–1 unless `signed`, `unitLabel` set whenever `unit` is `other`, `window` set on
-counters, balance present on `prepaid` and `quota` vendors and absent on
+counters and drawn from §6.4, balance present on `prepaid` and `quota` vendors and absent on
 `postpaid` and `free`. *Errors.*
 
 **2. Consistent.** The document agrees with itself:
@@ -1159,7 +1213,7 @@ counters, balance present on `prepaid` and `quota` vendors and absent on
 *Errors.* Each is a case where a UI renders something confidently wrong rather
 than visibly broken.
 
-**3. Complete.** Recommended registry metrics present; `direction` set;
+**3. Complete.** The five recommended metrics (§6.2) present; `direction` set;
 `expected` on jobs, on `resource.processes`, and on any metric with a known
 normal range; both outcomes of `usage.requests` on every operation in `apis[]`;
 `resource.processes` and `resource.orphans` on every non-serverless host;
