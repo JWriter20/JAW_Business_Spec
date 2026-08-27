@@ -156,26 +156,28 @@ somewhere it can query by time.
   "status":   { … },            // REQUIRED
 
   "metrics":     [ … ],   // every number, point in time            §6
-  "services":    [ … ],   // what we run                            §7
-  "vendors":     [ … ],   // what we pay for                        §8
-  "hosts":       [ … ],   // machines we are responsible for        §9
-  "endpoints":   [ … ],   // URLs under health check               §10
-  "apis":        [ … ],   // every API surface and operation       §11
-  "jobs":        [ … ],   // crons and batches, with normal ranges  §12
-  "deployments": [ … ],   // what is running                       §13
+  "sources":     [ … ],   // where customers come from              §7
+  "funnel":      [ … ],   // the stages they pass through           §8
+  "services":    [ … ],   // what we run                            §9
+  "vendors":     [ … ],   // what we pay for                        §10
+  "hosts":       [ … ],   // machines we are responsible for        §11
+  "endpoints":   [ … ],   // URLs under health check               §12
+  "apis":        [ … ],   // every API surface and operation       §13
+  "jobs":        [ … ],   // crons and batches, with normal ranges  §14
+  "deployments": [ … ],   // what is running                       §15
 
-  "events":    [ … ],     // stream: notable things that happened  §14
-  "errors":    [ … ],     // stream: bucketed application errors   §15
-  "inbox":     [ … ],     // stream: new customer mail             §16
-  "issues":    [ … ],     // stream: public repo issues            §17
-  "ci":        [ … ],     // stream: failed CI and test runs       §18
+  "events":    [ … ],     // stream: notable things that happened  §16
+  "errors":    [ … ],     // stream: bucketed application errors   §17
+  "inbox":     [ … ],     // stream: new customer mail             §18
+  "issues":    [ … ],     // stream: public repo issues            §19
+  "ci":        [ … ],     // stream: failed CI and test runs       §20
 
-  "incidents":  [ … ],    // open and recently resolved            §19
-  "domains":    [ … ],    // registrations and expiry              §20
-  "compliance": [ … ],    // filings, registrations, insurance     §21
+  "incidents":  [ … ],    // open and recently resolved            §21
+  "domains":    [ … ],    // registrations and expiry              §22
+  "compliance": [ … ],    // filings, registrations, insurance     §23
 
-  "extra":       { … },   // free-form                             §22
-  "unavailable": [ … ]    // sections this report could not produce §22
+  "extra":       { … },   // free-form                             §24
+  "unavailable": [ … ]    // sections this report could not produce §24
 }
 ```
 
@@ -291,14 +293,15 @@ A metric may name what it is about. All are optional; more than one may be set.
 | `job` | `jobs[].id` | rows processed by the nightly ingest |
 | `endpoint` | `endpoints[].id` | check latency for the health URL |
 | `api` | `apis[].id` | calls to `POST /v1/solve` |
+| `source` | `sources[].id` | signups from the newsletter |
+| `stage` | `funnel[].id` | people who finished onboarding |
 | `instance` | free text, within the scope above | `/data`, `gpu0`, `queue:apply` |
 | `outcome` | `success` \| `failure` | attempts that succeeded vs failed |
 
 Unscoped means business-wide. `revenue.net` with no scope is the company's;
 `revenue.net` with `service: "api"` is that product line's.
 
-**Identity is the whole tuple**: `id` + `service` + `host` + `vendor` + `job` +
-`endpoint` + `api` + `instance` + `outcome`, and it must be unique in the
+**Identity is `id` plus every scope label above**, and it must be unique in the
 document. Everything else — which services are busy, which are idle, which earn
 money, which leak memory — is a group-by on the consumer's side.
 
@@ -432,6 +435,16 @@ The vendor axis is usually free — bills arrive itemized. Attributing spend to
 your *own* services generally needs resource tagging you may not have, so an
 estimate with a `note` beats an omission, and no breakdown at all is fine.
 
+**Acquisition and funnel** — scope with `source` and `stage`.
+
+| id | unit | kind | direction | meaning |
+|---|---|---|---|---|
+| `funnel.count` | `count` | gauge | up_good | People who reached this stage. Scope with `stage`, and with `source` for the cross-tab. |
+| `funnel.conversion` | `ratio` | ratio | up_good | Reached this stage ÷ reached the one before it. |
+| `funnel.time_to_convert_p50` | `seconds` | gauge | down_good | Median time to get from the previous stage to this one. |
+| `acquisition.cac` | `usd_cents` | gauge | down_good | Spend on a source ÷ paying customers it produced. |
+| `acquisition.ltv` | `usd_cents` | gauge | up_good | Net revenue expected from a customer, by source. |
+
 **Support, code, and paperwork**
 
 | id | unit | kind | direction | meaning |
@@ -490,7 +503,115 @@ figures should carry. Do not convert it to `30d` by arithmetic.
 
 ---
 
-## 7. `services` — what we run
+## 7. `sources` — where customers come from
+
+One row per acquisition source. Traffic, signups, and revenue attach to it as
+metrics scoped with `source` (§6.1).
+
+```jsonc
+{
+  "id": "paid-search",             // REQUIRED. stable
+  "name": "Paid search — launch",  // REQUIRED
+  "kind": "paid",                  // REQUIRED. search | social | referral | direct
+                                   // | paid | affiliate | email | partner | other
+  "attribution": "last_touch",     // REQUIRED. first_touch | last_touch
+                                   //           | linear | none
+  "utm": {
+    "source": "search",            // the utm_* tuple, as recorded
+    "medium": "cpc",
+    "campaign": "launch-q3",
+    "content": null,
+    "term": null
+  },
+  "referrerDomain": null,          // for referral traffic
+  "paid": true,                    // does money go out for this source
+  "active": true,                  // is it currently running
+  "since": "2026-07-01T00:00:00.000Z",
+  "note": "Attributed by the ad platform, so last touch. Organic rows are first touch."
+}
+```
+
+### Rules
+
+- **One row per source, not per URL.** Group by the utm tuple you actually plan
+  to read. A row per landing page or per ad creative makes cardinality unbounded
+  and the section unreadable, the same failure as concrete paths in §13.
+- **State the attribution model on every row.** First touch and last touch
+  produce different numbers from the same week, and a mixed set that does not say
+  which is a set nobody can add up. Mixing is legitimate — ad platforms report
+  last touch, your own database usually knows first touch — but say so per row.
+- **`direct` is a real row, not a gap.** It is where everything unattributable
+  lands, and its size is the honest measure of how much of this section to trust.
+- **No per-person attribution.** No click ids, no visitor ids, no IPs, no
+  landing-page URLs with identifiers in them. This section is counts by source;
+  the individual journey stays in whatever tool recorded it.
+- Spend on a paid source is `cost.spend` scoped with `source`, which is what
+  makes `acquisition.cac` a number rather than a guess.
+
+---
+
+## 8. `funnel` — the stages between finding you and paying you
+
+Stages in order. Counts attach as `funnel.count` scoped with `stage`, and the
+cross-tab with `source` is what says which channel sends people who actually
+convert.
+
+```jsonc
+{
+  "id": "signup",                  // REQUIRED. stable
+  "name": "Created an account",    // REQUIRED
+  "position": 3,                   // REQUIRED. ascending, unique. conversion is
+                                   //           measured against position - 1
+  "kind": "signup",                // REQUIRED. impression | visit | signup
+                                   // | activation | habit | paid | expansion
+                                   // | other
+  "basis": "cohort",               // REQUIRED. window | cohort
+  "cohort": {                      // REQUIRED when basis is cohort
+    "window": "30d",               // who entered the first cohort stage then
+    "observedForDays": 30          // how long they have been watched since
+  },
+  "optional": false,               // may a person skip this stage
+  "note": null
+}
+```
+
+`kind` is a small fixed vocabulary so a dashboard can line up funnels from
+businesses whose stages are named nothing alike. `name` stays yours.
+
+### `basis` is the field that decides whether the rate means anything
+
+- **`window`** — people who did this in the window. Cheap, current, and it mixes
+  cohorts: the people who paid today are not the people who visited today.
+- **`cohort`** — of the people who entered the first cohort-basis stage during
+  `cohort.window`, how many have since reached this one. Correct, and it lags by
+  however long conversion takes.
+
+A funnel that quietly mixes the two produces conversion rates that are wrong in
+a direction nobody notices — growing traffic makes window-basis conversion look
+like it is falling, and shrinking traffic makes it look like it is improving.
+
+**Stages before you can identify a person are window-basis by necessity.** You
+cannot cohort an impression. Mark the boundary and treat the crossing rate as an
+estimate: impressions-to-visits is a ratio of two populations, not a conversion.
+Everything from the first identified stage onward should share one basis.
+
+`funnel.time_to_convert_p50` on a stage is what tells you whether the cohort has
+been watched long enough. A 30-day cohort reporting a paid conversion whose
+median time to convert is 11 days is mature; one whose median is 40 days is
+reporting a number that will keep rising after you read it.
+
+### Rules
+
+- Positions are unique and ascending. Gaps are fine; two stages sharing a
+  position is not.
+- `funnel.conversion` on a stage is against the previous position, and must agree
+  with the two counts where both are present.
+- Per-source counts never exceed the unscoped count for the same stage.
+- Report the stages you have. Four honest stages beat six where two are guesses.
+
+---
+
+## 9. `services` — what we run
 
 Identity, health, and shape. Every number about a service is a metric scoped to
 its `id` (§6.1).
@@ -502,7 +623,7 @@ its `id` (§6.1).
   "status": "up",                // REQUIRED. up | degraded | down | unknown
   "kind": "api",                 // api | worker | inference | db | queue | cron
                                  // | frontend | mobile | external | other
-  "parent": null,                // §7.1 — id of the service this belongs to
+  "parent": null,                // §9.1 — id of the service this belongs to
   "critical": true,              // does down here mean customers are affected?
   "serverless": false,           // true = no host to report resources for
   "hosts": ["app-01"],           // hosts[].id it runs on
@@ -522,7 +643,7 @@ with greyed dependents instead of nine red alerts. `critical: false` is for what
 is allowed to be down at 3am. `startedAt` is what lets a consumer tell a memory
 leak from a restart sawtooth.
 
-### 7.1 Sub-services
+### 9.1 Sub-services
 
 `parent` nests a service inside another. Use it when one logical service is
 really N of the same thing and you want both the roll-up and the parts.
@@ -562,7 +683,7 @@ Rules:
 
 ---
 
-## 8. `vendors` — what we pay for
+## 10. `vendors` — what we pay for
 
 One entry per external account: spend, usage, what is left, and when the period
 rolls. This is the section that answers "are expenditures getting out of hand".
@@ -643,7 +764,7 @@ the gap is spend the provider did not attribute.
 
 ---
 
-## 9. `hosts` — machines we are responsible for
+## 11. `hosts` — machines we are responsible for
 
 Identity only. CPU, memory, VRAM, disk, network, sockets are metrics scoped with
 `host` (§6.2, Machines).
@@ -687,7 +808,7 @@ gap — there is nothing to watch.
 
 ---
 
-## 10. `endpoints` — URLs under health check
+## 12. `endpoints` — URLs under health check
 
 ```jsonc
 {
@@ -713,7 +834,7 @@ belongs on the thing that serves it, not in a calendar somewhere.
 
 ---
 
-## 11. `apis` — every API surface and operation
+## 13. `apis` — every API surface and operation
 
 What the business exposes and how hard it is being called. One row per surface,
 one row per operation, linked by `parent` — the same nesting as services.
@@ -770,7 +891,7 @@ number you already have and cannot act on.
 
 ---
 
-## 12. `jobs` — crons and batches
+## 14. `jobs` — crons and batches
 
 Point-in-time state of every scheduled thing, plus the range that counts as
 normal.
@@ -810,7 +931,7 @@ the declared range.
 
 ---
 
-## 13. `deployments` — what is running
+## 15. `deployments` — what is running
 
 ```jsonc
 {
@@ -840,7 +961,7 @@ button say where it is going before you press it.
 
 ---
 
-## 14. `events` — stream: notable things that happened
+## 16. `events` — stream: notable things that happened
 
 Everything a human would want told about after the fact. Only items after the
 `events` cursor.
@@ -874,7 +995,7 @@ few hundred times a day it is a metric, not an event.
 
 ---
 
-## 15. `errors` — stream: bucketed application errors
+## 17. `errors` — stream: bucketed application errors
 
 **Grouped, never raw.** One entry per distinct failure, with a count. A thousand
 identical timeouts is one bucket with `count: 1000`.
@@ -910,7 +1031,7 @@ identical timeouts is one bucket with `count: 1000`.
 
 ---
 
-## 16. `inbox` — stream: new customer mail
+## 18. `inbox` — stream: new customer mail
 
 Every support channel that receives customer messages, in one queue. Items after
 the `inbox` cursor.
@@ -939,7 +1060,7 @@ another machine. Mask the address; the real one is behind the link.
 
 ---
 
-## 17. `issues` — stream: public repository issues
+## 19. `issues` — stream: public repository issues
 
 Links and titles only, and **public repositories only**. Issues opened or
 updated since the `issues` cursor.
@@ -966,7 +1087,7 @@ Private repositories stay out — their titles leak roadmap and customers.
 
 ---
 
-## 18. `ci` — stream: failed builds and tests
+## 20. `ci` — stream: failed builds and tests
 
 Runs since the `ci` cursor that did not pass. Successes are a metric
 (`ci.pass_rate`), not a list.
@@ -993,7 +1114,7 @@ Runs since the `ci` cursor that did not pass. Successes are a metric
 
 ---
 
-## 19. `incidents` — open and recently resolved
+## 21. `incidents` — open and recently resolved
 
 ```jsonc
 {
@@ -1022,7 +1143,7 @@ drop them.
 
 ---
 
-## 20. `domains`
+## 22. `domains`
 
 ```jsonc
 {
@@ -1042,11 +1163,11 @@ drop them.
 ```
 
 `autoRenew: false` on a domain the business is served from is a self-inflicted
-outage with a date on it. Certificates live on `endpoints[].tls` (§10).
+outage with a date on it. Certificates live on `endpoints[].tls` (§12).
 
 ---
 
-## 21. `compliance` — filings, registrations, insurance
+## 23. `compliance` — filings, registrations, insurance
 
 The paperwork that quietly expires: entity good standing, annual reports,
 franchise tax, registered agent, insurance, licences.
@@ -1076,7 +1197,7 @@ to check. Say it out loud months early.
 
 ---
 
-## 22. `extra` and `unavailable`
+## 24. `extra` and `unavailable`
 
 ```jsonc
 "extra": {
@@ -1103,7 +1224,7 @@ dropped buffer (§2, rule 6) is declared here too.
 
 ---
 
-## 23. Limits
+## 25. Limits
 
 | Thing | Cap | Over the cap |
 |---|---|---|
@@ -1114,6 +1235,8 @@ dropped buffer (§2, rule 6) is declared here too.
 | `hosts` | 50 | Truncated. |
 | `endpoints` | 100 | Truncated, `down` first. |
 | `apis` | 500 | Truncated, most-called first, surfaces before operations. |
+| `sources` | 200 | Truncated, most traffic first. |
+| `funnel` | 20 | Truncated from the bottom of the funnel up. |
 | `jobs` | 100 | Truncated, not-`ok` first. |
 | `deployments` | 100 | Truncated. |
 | `events` | 500 | §2 rule 4. |
@@ -1135,7 +1258,7 @@ Snapshots truncate by dropping the least important rows, and are.
 
 ---
 
-## 24. Security
+## 26. Security
 
 This document is a complete operational picture of a company behind one bearer
 token, fetched by a machine that holds the same for every other company.
@@ -1162,7 +1285,7 @@ token, fetched by a machine that holds the same for every other company.
 
 ---
 
-## 25. Versioning
+## 27. Versioning
 
 `spec` is `"business-report/<major>"`. Consumers accept the current major and
 the one before it.
@@ -1177,20 +1300,21 @@ that lies about last month.
 
 ---
 
-## 26. Conformance
+## 28. Conformance
 
 A checker takes a report from a file, or from a live endpoint with a token, and
 runs four passes.
 
 **1. Valid.** Required fields present, enums known, money integral, ratios in
 0–1 unless `signed`, `unitLabel` set whenever `unit` is `other`, `window` set on
-counters and drawn from §6.4, balance present on `prepaid` and `quota` vendors and absent on
+counters and drawn from §6.4, `cohort` present on every cohort-basis funnel
+stage, balance present on `prepaid` and `quota` vendors and absent on
 `postpaid` and `free`. *Errors.*
 
 **2. Consistent.** The document agrees with itself:
 
-- Every `service`, `host`, `vendor`, `job`, `endpoint`, `api` on a metric
-  resolves.
+- Every `service`, `host`, `vendor`, `job`, `endpoint`, `api`, `source`, `stage`
+  on a metric resolves.
 - Every `services[].parent`, `vendors[].parent`, `apis[].parent`, `dependsOn`,
   `hosts[].services`, `apis[].service`, and `endpoints[].service` resolves. No
   parent cycles.
@@ -1202,6 +1326,9 @@ counters and drawn from §6.4, balance present on `prepaid` and `quota` vendors 
 - Every `expected` has `min <= max`.
 - Where an operation reports both outcomes and `usage.error_rate`, the rate
   matches the counts within 1% relative.
+- `funnel[].position` values are unique. Where a stage reports
+  `funnel.conversion` and both counts exist, the rate matches within 1%.
+- A stage count scoped to a source never exceeds that stage's unscoped count.
 - No single-label group of `cost.spend` exceeds `cost.total` for the same
   window, and child vendor spend sums to no more than the parent's.
 - Every stream item falls after the requested cursor and at or before that
@@ -1249,8 +1376,9 @@ The story it tells: source B has been dead for a day, `POST /v1/export` is
 failing every call, the hourly rollup just processed ten times its normal volume,
 the worker's memory is above its range with an orphaned process left over from a
 restart, a GPU is over its temperature band, the proxy balance runs out in three
-days, one domain is 21 days from expiry with auto-renew off, and the franchise
-tax is due.
+days, one domain is 21 days from expiry with auto-renew off, the franchise tax
+is due, and paid search is bringing a quarter of the traffic, a tenth of the
+signups, and an LTV only 1.9x its CAC.
 
 ```json
 {
@@ -1387,6 +1515,36 @@ tax is due.
     { "id": "acme.solve.attempts", "label": "Solves — failed", "value": 178, "unit": "count", "kind": "counter", "window": "1h", "service": "inference", "outcome": "failure", "group": "Product", "direction": "down_good", "expected": { "min": 0, "max": 400 } },
     { "id": "acme.model.accuracy", "label": "Model accuracy", "value": 0.941, "unit": "ratio", "kind": "ratio", "window": "24h", "service": "inference", "group": "Product", "direction": "up_good", "target": 0.95 },
 
+    { "id": "funnel.count", "label": "Search impressions", "value": 412000, "unit": "count", "kind": "gauge", "window": "30d", "stage": "impression", "group": "Funnel", "direction": "up_good" },
+    { "id": "funnel.count", "label": "Visits", "value": 18400, "unit": "count", "kind": "gauge", "window": "30d", "stage": "visit", "group": "Funnel", "direction": "up_good", "featured": true },
+    { "id": "funnel.count", "label": "Signups", "value": 1240, "unit": "count", "kind": "gauge", "stage": "signup", "group": "Funnel", "direction": "up_good" },
+    { "id": "funnel.count", "label": "Finished onboarding", "value": 812, "unit": "count", "kind": "gauge", "stage": "onboarded", "group": "Funnel", "direction": "up_good" },
+    { "id": "funnel.count", "label": "Using it weekly", "value": 604, "unit": "count", "kind": "gauge", "stage": "active", "group": "Funnel", "direction": "up_good" },
+    { "id": "funnel.count", "label": "Converted to paid", "value": 96, "unit": "count", "kind": "gauge", "stage": "paid", "group": "Funnel", "direction": "up_good" },
+
+    { "id": "funnel.conversion", "label": "Impression → visit", "value": 0.0447, "unit": "ratio", "kind": "ratio", "stage": "visit", "group": "Funnel", "direction": "up_good", "note": "Two populations, not a conversion — both stages are window basis." },
+    { "id": "funnel.conversion", "label": "Visit → signup", "value": 0.0674, "unit": "ratio", "kind": "ratio", "stage": "signup", "group": "Funnel", "direction": "up_good", "note": "Crosses the window/cohort boundary. Read as an estimate." },
+    { "id": "funnel.conversion", "label": "Signup → onboarded", "value": 0.6548, "unit": "ratio", "kind": "ratio", "stage": "onboarded", "group": "Funnel", "direction": "up_good", "expected": { "min": 0.6, "max": 0.8 } },
+    { "id": "funnel.conversion", "label": "Onboarded → weekly", "value": 0.7438, "unit": "ratio", "kind": "ratio", "stage": "active", "group": "Funnel", "direction": "up_good" },
+    { "id": "funnel.conversion", "label": "Weekly → paid", "value": 0.1589, "unit": "ratio", "kind": "ratio", "stage": "paid", "group": "Funnel", "direction": "up_good", "target": 0.2, "featured": true },
+    { "id": "funnel.time_to_convert_p50", "label": "Signup → onboarded, median", "value": 420, "unit": "seconds", "kind": "gauge", "stage": "onboarded", "group": "Funnel", "direction": "down_good" },
+    { "id": "funnel.time_to_convert_p50", "label": "Weekly → paid, median", "value": 950400, "unit": "seconds", "kind": "gauge", "stage": "paid", "group": "Funnel", "direction": "down_good", "note": "11 days, so the 30-day cohort is mature enough to read." },
+
+    { "id": "funnel.count", "label": "Visits — organic search", "value": 8900, "unit": "count", "kind": "gauge", "window": "30d", "stage": "visit", "source": "organic-search", "group": "Acquisition", "direction": "up_good" },
+    { "id": "funnel.count", "label": "Visits — paid search", "value": 4200, "unit": "count", "kind": "gauge", "window": "30d", "stage": "visit", "source": "paid-search", "group": "Acquisition", "direction": "up_good" },
+    { "id": "funnel.count", "label": "Visits — partner blog", "value": 2610, "unit": "count", "kind": "gauge", "window": "30d", "stage": "visit", "source": "partner-blog", "group": "Acquisition", "direction": "up_good" },
+    { "id": "funnel.count", "label": "Visits — newsletter", "value": 1890, "unit": "count", "kind": "gauge", "window": "30d", "stage": "visit", "source": "newsletter", "group": "Acquisition", "direction": "up_good" },
+    { "id": "funnel.count", "label": "Visits — direct", "value": 800, "unit": "count", "kind": "gauge", "window": "30d", "stage": "visit", "source": "direct", "group": "Acquisition", "direction": "up_good" },
+    { "id": "funnel.count", "label": "Signups — organic search", "value": 700, "unit": "count", "kind": "gauge", "stage": "signup", "source": "organic-search", "group": "Acquisition", "direction": "up_good" },
+    { "id": "funnel.count", "label": "Signups — paid search", "value": 121, "unit": "count", "kind": "gauge", "stage": "signup", "source": "paid-search", "group": "Acquisition", "direction": "up_good", "severity": "warn", "note": "23% of visits, 10% of signups." },
+    { "id": "funnel.count", "label": "Signups — partner blog", "value": 240, "unit": "count", "kind": "gauge", "stage": "signup", "source": "partner-blog", "group": "Acquisition", "direction": "up_good" },
+    { "id": "funnel.count", "label": "Signups — newsletter", "value": 139, "unit": "count", "kind": "gauge", "stage": "signup", "source": "newsletter", "group": "Acquisition", "direction": "up_good" },
+    { "id": "funnel.count", "label": "Signups — direct", "value": 40, "unit": "count", "kind": "gauge", "stage": "signup", "source": "direct", "group": "Acquisition", "direction": "up_good" },
+    { "id": "funnel.count", "label": "Paid — paid search", "value": 9, "unit": "count", "kind": "gauge", "stage": "paid", "source": "paid-search", "group": "Acquisition", "direction": "up_good" },
+    { "id": "cost.spend", "label": "Spend — paid search", "value": 41850, "unit": "usd_cents", "kind": "counter", "window": "30d", "source": "paid-search", "group": "Acquisition", "direction": "down_good" },
+    { "id": "acquisition.cac", "label": "CAC — paid search", "value": 4650, "unit": "usd_cents", "kind": "gauge", "window": "30d", "source": "paid-search", "group": "Acquisition", "direction": "down_good", "severity": "warn" },
+    { "id": "acquisition.ltv", "label": "LTV — paid search", "value": 8900, "unit": "usd_cents", "kind": "gauge", "source": "paid-search", "group": "Acquisition", "direction": "up_good", "note": "1.9x CAC. Below the 3x the other channels clear." },
+
     { "id": "usage.requests", "label": "POST /v1/solve — succeeded", "value": 34042, "unit": "count", "kind": "counter", "window": "1h", "api": "api-public:POST /v1/solve", "outcome": "success", "group": "API", "direction": "up_good" },
     { "id": "usage.requests", "label": "POST /v1/solve — failed", "value": 126, "unit": "count", "kind": "counter", "window": "1h", "api": "api-public:POST /v1/solve", "outcome": "failure", "group": "API", "direction": "down_good" },
     { "id": "usage.error_rate", "label": "POST /v1/solve error rate", "value": 0.0037, "unit": "ratio", "kind": "ratio", "window": "1h", "api": "api-public:POST /v1/solve", "group": "API", "direction": "down_good" },
@@ -1408,10 +1566,10 @@ tax is due.
     { "id": "usage.requests", "label": "POST /hooks/payments — succeeded", "value": 214, "unit": "count", "kind": "counter", "window": "1h", "api": "api-hooks:POST /hooks/payments", "outcome": "success", "group": "API", "direction": "up_good" },
     { "id": "usage.requests", "label": "POST /hooks/payments — failed", "value": 6, "unit": "count", "kind": "counter", "window": "1h", "api": "api-hooks:POST /hooks/payments", "outcome": "failure", "group": "API", "direction": "down_good", "note": "Six retried deliveries from the payment processor. Same batch as the failed renewals." },
 
-    { "id": "cost.spend", "label": "Spend — API", "value": 61200, "unit": "usd_cents", "kind": "counter", "window": "30d", "service": "api", "group": "Cost", "direction": "down_good" },
-    { "id": "cost.spend", "label": "Spend — inference", "value": 84000, "unit": "usd_cents", "kind": "counter", "window": "30d", "service": "inference", "group": "Cost", "direction": "down_good" },
-    { "id": "cost.spend", "label": "Spend — ingest", "value": 34200, "unit": "usd_cents", "kind": "counter", "window": "30d", "service": "ingest", "group": "Cost", "direction": "down_good" },
-    { "id": "cost.spend", "label": "Spend — worker", "value": 12000, "unit": "usd_cents", "kind": "counter", "window": "30d", "service": "worker", "group": "Cost", "direction": "down_good" },
+    { "id": "cost.spend", "label": "Spend — API", "value": 49000, "unit": "usd_cents", "kind": "counter", "window": "30d", "service": "api", "group": "Cost", "direction": "down_good" },
+    { "id": "cost.spend", "label": "Spend — inference", "value": 70000, "unit": "usd_cents", "kind": "counter", "window": "30d", "service": "inference", "group": "Cost", "direction": "down_good" },
+    { "id": "cost.spend", "label": "Spend — ingest", "value": 21550, "unit": "usd_cents", "kind": "counter", "window": "30d", "service": "ingest", "group": "Cost", "direction": "down_good" },
+    { "id": "cost.spend", "label": "Spend — worker", "value": 9000, "unit": "usd_cents", "kind": "counter", "window": "30d", "service": "worker", "group": "Cost", "direction": "down_good" },
 
     { "id": "resource.processes", "label": "app-01 managed processes", "value": 14, "unit": "count", "kind": "gauge", "host": "app-01", "group": "Machines", "direction": "neutral", "expected": { "min": 12, "max": 13 }, "severity": "warn", "note": "One more than the supervisor accounts for." },
     { "id": "resource.orphans", "label": "app-01 orphaned processes", "value": 1, "unit": "count", "kind": "gauge", "host": "app-01", "group": "Machines", "direction": "down_good", "expected": { "min": 0, "max": 0 }, "severity": "warn", "note": "A worker from the 09:12 restart, reparented to init. Still holding 1.1 GB and a queue connection." },
@@ -1496,6 +1654,11 @@ tax is due.
       "usage": { "used": 41200, "included": 100000, "remaining": null, "unit": "count", "unitLabel": "emails" },
       "asOf": "2026-08-26T18:03:40.000Z" },
 
+    { "id": "ads", "name": "Search ad platform", "billing": "postpaid", "status": "ok", "category": "marketing",
+      "period": { "start": "2026-08-01T00:00:00.000Z", "end": "2026-08-31T23:59:59.000Z", "renewsAt": null, "resetsAt": null },
+      "plan": { "name": "Auction", "cents": null, "interval": "none" },
+      "spend": { "periodToDateCents": 41850, "projectedPeriodCents": 49000, "asOf": "2026-08-26T06:00:00.000Z" },
+      "accountUrl": "https://example.com/ads", "asOf": "2026-08-26T18:03:40.000Z" },
     { "id": "errors-saas", "name": "Error tracking (free tier)", "billing": "free", "status": "warn", "category": "saas",
       "period": { "start": "2026-08-01T00:00:00.000Z", "end": "2026-08-31T23:59:59.000Z", "resetsAt": "2026-09-01T00:00:00.000Z" },
       "plan": { "name": "Free", "cents": 0, "interval": "monthly" },
@@ -1526,6 +1689,40 @@ tax is due.
     { "id": "docs", "url": "https://docs.acme.example", "status": "degraded", "service": "web",
       "checkedAt": "2026-08-26T18:03:55.000Z", "statusCode": 200, "latencyMs": 3120, "from": "us-west", "expectStatus": 200,
       "tls": { "expiresAt": "2026-11-02T00:00:00.000Z", "issuer": "Example CA", "daysRemaining": 68 } }
+  ],
+
+  "sources": [
+    { "id": "organic-search", "name": "Organic search", "kind": "search", "attribution": "first_touch",
+      "utm": { "source": "search", "medium": "organic" }, "paid": false, "active": true },
+    { "id": "paid-search", "name": "Paid search — launch", "kind": "paid", "attribution": "last_touch",
+      "utm": { "source": "search", "medium": "cpc", "campaign": "launch-q3" }, "paid": true, "active": true,
+      "since": "2026-07-01T00:00:00.000Z",
+      "note": "Attributed by the ad platform, so last touch. The organic rows are first touch." },
+    { "id": "partner-blog", "name": "Partner blog", "kind": "referral", "attribution": "first_touch",
+      "utm": { "source": "partner", "medium": "referral" }, "referrerDomain": "blog.partner.example",
+      "paid": false, "active": true },
+    { "id": "newsletter", "name": "Newsletter", "kind": "email", "attribution": "last_touch",
+      "utm": { "source": "newsletter", "medium": "email", "campaign": "weekly" }, "paid": false, "active": true },
+    { "id": "direct", "name": "Direct and unattributed", "kind": "direct", "attribution": "none",
+      "paid": false, "active": true,
+      "note": "Everything with no referrer or no utm tuple. 4% of visits, so the rest of this section is worth reading." }
+  ],
+
+  "funnel": [
+    { "id": "impression", "name": "Saw us in search results", "position": 1, "kind": "impression",
+      "basis": "window", "optional": false,
+      "note": "Search console, window basis — there is no person to cohort yet." },
+    { "id": "visit", "name": "Landed on the site", "position": 2, "kind": "visit",
+      "basis": "window", "optional": false },
+    { "id": "signup", "name": "Created an account", "position": 3, "kind": "signup",
+      "basis": "cohort", "cohort": { "window": "30d", "observedForDays": 30 }, "optional": false,
+      "note": "First identified stage. Everything below shares this cohort." },
+    { "id": "onboarded", "name": "Finished onboarding", "position": 4, "kind": "activation",
+      "basis": "cohort", "cohort": { "window": "30d", "observedForDays": 30 }, "optional": false },
+    { "id": "active", "name": "Used it in 3 of the last 4 weeks", "position": 5, "kind": "habit",
+      "basis": "cohort", "cohort": { "window": "30d", "observedForDays": 30 }, "optional": false },
+    { "id": "paid", "name": "Converted to a paid plan", "position": 6, "kind": "paid",
+      "basis": "cohort", "cohort": { "window": "30d", "observedForDays": 30 }, "optional": false }
   ],
 
   "apis": [
