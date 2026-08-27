@@ -417,6 +417,38 @@ leak, a full disk, or a saturated NIC shows up.
 | `resource.processes` | `count` | gauge | neutral | Live processes we manage. Scope by host or service, and set `expected` — the right number is a known number. |
 | `resource.orphans` | `count` | gauge | down_good | Processes matching a managed service that no supervisor owns: reparented to init when their parent died, or left behind by a previous release. Expected zero. |
 
+**Data stores** — scope with `service` and `instance`, where `instance` is the
+table or collection.
+
+| id | unit | kind | direction | meaning |
+|---|---|---|---|---|
+| `db.rows` | `count` | gauge | neutral | Live row estimate. |
+| `db.bytes` | `bytes` | gauge | neutral | Size on disk, table plus indexes. |
+| `db.reads` | `count` | counter | neutral | Rows or read units consumed in the window. |
+| `db.writes` | `count` | counter | neutral | Inserts, updates, and deletes in the window. |
+| `db.seq_scans` | `count` | counter | down_good | Sequential scans. Climbing while `db.rows` is flat is a missing index. |
+| `db.reads_per_request` | `count` | gauge | down_good | `db.reads` ÷ requests served. |
+| `db.dead_rows` | `count` | gauge | down_good | Dead tuples awaiting vacuum. |
+| `db.query_p95` | `ms` | gauge | down_good | p95 query time. |
+| `db.connections` | `count` | gauge | down_good | Open connections, against the pool limit. |
+| `db.replication_lag` | `seconds` | gauge | down_good | How far a replica trails. |
+
+Take all of these from the database's own statistics view —
+`pg_stat_user_tables`, `performance_schema`, the platform's per-table metrics —
+never by querying the data. **`db.rows` is an estimate on purpose.**
+`SELECT count(*)` is a full scan in most engines and gets slower every day,
+while the live-row estimate sitting in the stats view is free and is accurate
+enough to notice a table that stopped growing.
+
+**`db.reads_per_request` is the one that catches a code change.** A raw read
+rate rises with traffic, so a busy Tuesday and an accidental N+1 look identical.
+Divide by requests and traffic cancels out: a deploy that turns one query into
+forty moves this number and nothing else. Put an `expected` band on it, and do
+the same per job run for anything batch.
+
+One `instance` per table. A row per query shape belongs in your APM — the
+cardinality is unbounded, and this document has a 1000-metric cap.
+
 **Money out**
 
 | id | unit | kind | direction | meaning |
@@ -1496,7 +1528,9 @@ days, one domain is 21 days from expiry with auto-renew off, the franchise tax
 is due, paid search is bringing a quarter of the traffic, a tenth of the signups
 and an LTV only 1.9x its CAC, and $196 of card spend belongs to no tracked
 vendor. The LLM account also runs dry this week and does not appear as a risk,
-because it tops itself up.
+because it tops itself up. And since the 17:31 deploy, the database is serving
+three times the reads per request against a flat row count — the shape of an
+index that stopped being used.
 
 ```json
 {
@@ -1594,6 +1628,21 @@ because it tops itself up.
     { "id": "jobs.failed", "label": "Failed job runs", "value": 0, "unit": "count", "kind": "counter", "window": "24h", "group": "Jobs", "direction": "down_good" },
     { "id": "ci.failed_runs", "label": "Failed CI runs", "value": 1, "unit": "count", "kind": "counter", "window": "24h", "group": "Code", "direction": "down_good" },
     { "id": "ci.pass_rate", "label": "CI pass rate", "value": 0.92, "unit": "ratio", "kind": "ratio", "window": "7d", "group": "Code", "direction": "up_good" },
+
+    { "id": "db.reads_per_request", "label": "DB reads per API request", "value": 41.2, "unit": "count", "kind": "gauge", "window": "5m", "service": "postgres", "group": "Data", "direction": "down_good", "expected": { "min": 8, "max": 18 }, "severity": "crit", "note": "Was 12 before web 2.8.0 shipped at 17:31. Same traffic, three times the reads." },
+    { "id": "db.rows", "label": "users rows", "value": 18422, "unit": "count", "kind": "gauge", "service": "postgres", "instance": "users", "group": "Data", "direction": "neutral" },
+    { "id": "db.rows", "label": "solves rows", "value": 4120880, "unit": "count", "kind": "gauge", "service": "postgres", "instance": "solves", "group": "Data", "direction": "neutral" },
+    { "id": "db.rows", "label": "sessions rows", "value": 91204, "unit": "count", "kind": "gauge", "service": "postgres", "instance": "sessions", "group": "Data", "direction": "neutral" },
+    { "id": "db.bytes", "label": "solves on disk", "value": 9019431322, "unit": "bytes", "kind": "gauge", "service": "postgres", "instance": "solves", "group": "Data", "direction": "neutral" },
+    { "id": "db.reads", "label": "solves reads", "value": 1840000, "unit": "count", "kind": "counter", "window": "1h", "service": "postgres", "instance": "solves", "group": "Data", "direction": "neutral", "expected": { "min": 300000, "max": 700000 }, "severity": "warn" },
+    { "id": "db.writes", "label": "solves writes", "value": 41200, "unit": "count", "kind": "counter", "window": "1h", "service": "postgres", "instance": "solves", "group": "Data", "direction": "neutral" },
+    { "id": "db.reads", "label": "users reads", "value": 412000, "unit": "count", "kind": "counter", "window": "1h", "service": "postgres", "instance": "users", "group": "Data", "direction": "neutral" },
+    { "id": "db.writes", "label": "users writes", "value": 812, "unit": "count", "kind": "counter", "window": "1h", "service": "postgres", "instance": "users", "group": "Data", "direction": "neutral" },
+    { "id": "db.seq_scans", "label": "solves sequential scans", "value": 1840, "unit": "count", "kind": "counter", "window": "1h", "service": "postgres", "instance": "solves", "group": "Data", "direction": "down_good", "expected": { "min": 0, "max": 50 }, "severity": "crit", "note": "Row count is flat, so this is a query that stopped using an index." },
+    { "id": "db.dead_rows", "label": "solves dead rows", "value": 184000, "unit": "count", "kind": "gauge", "service": "postgres", "instance": "solves", "group": "Data", "direction": "down_good" },
+    { "id": "db.query_p95", "label": "Query p95", "value": 128, "unit": "ms", "kind": "gauge", "window": "5m", "service": "postgres", "group": "Data", "direction": "down_good", "expected": { "min": 5, "max": 80 }, "severity": "warn" },
+    { "id": "db.connections", "label": "DB connections", "value": 74, "unit": "count", "kind": "gauge", "service": "postgres", "group": "Data", "direction": "down_good", "expected": { "min": 0, "max": 80 }, "severity": "warn", "note": "Pool limit is 80." },
+    { "id": "db.replication_lag", "label": "Replica lag", "value": 0.4, "unit": "seconds", "kind": "gauge", "service": "postgres", "group": "Data", "direction": "down_good" },
 
     { "id": "resource.cpu_pct", "label": "app-01 CPU", "value": 34.2, "unit": "percent", "kind": "gauge", "host": "app-01", "group": "Machines", "direction": "down_good" },
     { "id": "resource.mem_pct", "label": "app-01 memory", "value": 78.4, "unit": "percent", "kind": "gauge", "host": "app-01", "group": "Machines", "direction": "down_good", "severity": "warn" },
@@ -1706,7 +1755,7 @@ because it tops itself up.
     { "id": "api", "name": "Public API", "status": "up", "kind": "api", "critical": true, "serverless": false, "hosts": ["app-01"], "dependsOn": ["postgres", "queue", "inference"], "since": "2026-08-24T09:00:00.000Z", "startedAt": "2026-08-24T09:00:00.000Z", "version": "1.4.2", "checkedAt": "2026-08-26T18:03:58.000Z", "url": "https://api.acme.example", "env": "prod" },
     { "id": "worker", "name": "Async worker", "status": "degraded", "kind": "worker", "critical": true, "serverless": false, "hosts": ["app-01"], "dependsOn": ["queue", "postgres"], "since": "2026-08-26T17:38:20.000Z", "startedAt": "2026-08-26T17:38:20.000Z", "version": "1.4.2", "message": "Restarted twice in 24h on memory; RSS climbing again.", "checkedAt": "2026-08-26T18:03:58.000Z", "env": "prod" },
     { "id": "inference", "name": "Inference pool", "status": "up", "kind": "inference", "critical": true, "serverless": false, "hosts": ["gpu-01"], "since": "2026-08-16T02:20:00.000Z", "startedAt": "2026-08-16T02:20:00.000Z", "version": "0.9.4", "message": "1 GPU at 81°C, throttling.", "checkedAt": "2026-08-26T18:03:58.000Z", "env": "prod" },
-    { "id": "postgres", "name": "Postgres", "status": "up", "kind": "db", "critical": true, "serverless": false, "hosts": ["app-01"], "checkedAt": "2026-08-26T18:03:58.000Z", "env": "prod" },
+    { "id": "postgres", "name": "Postgres", "status": "degraded", "kind": "db", "critical": true, "serverless": false, "hosts": ["app-01"], "since": "2026-08-26T17:34:00.000Z", "message": "Reads per request tripled after web 2.8.0; connection pool near its limit.", "checkedAt": "2026-08-26T18:03:58.000Z", "env": "prod" },
     { "id": "queue", "name": "Job queue", "status": "up", "kind": "queue", "critical": true, "serverless": true, "checkedAt": "2026-08-26T18:03:58.000Z", "env": "prod" },
 
     { "id": "ingest", "name": "Data collection", "status": "degraded", "kind": "worker", "critical": true, "serverless": false, "hosts": ["app-01"], "dependsOn": ["postgres", "proxy-gateway"], "since": "2026-08-25T05:00:00.000Z", "message": "1 of 4 sources failing.", "checkedAt": "2026-08-26T18:03:58.000Z", "env": "prod" },
