@@ -290,7 +290,8 @@ drained on purpose this morning. A generic rule over generic fields gets that
 wrong and trains you to ignore the page.
 
 `down` = customers affected now. `warn` = a human today. `ok` = go do something
-else.
+else. Only an `audience: external` service can put the business at `down` (§9.1);
+a dead build pipeline is a `warn`, however loudly it is failing.
 
 ---
 
@@ -731,10 +732,11 @@ its `id` (§6.1).
   "id": "api",                   // REQUIRED. stable within the business
   "name": "Public API",          // REQUIRED
   "status": "up",                // REQUIRED. up | degraded | down | unknown
+  "audience": "external",        // REQUIRED. external | internal — §9.1
   "kind": "api",                 // api | worker | inference | db | queue | cron
-                                 // | frontend | mobile | external | other
-  "parent": null,                // §9.1 — id of the service this belongs to
-  "critical": true,              // does down here mean customers are affected?
+                                 // | frontend | mobile | thirdParty | other
+  "parent": null,                // §9.2 — id of the service this belongs to
+  "critical": true,              // within its audience, does this one wake someone?
   "serverless": false,           // true = no host to report resources for
   "hosts": ["app-01"],           // hosts[].id it runs on
   "dependsOn": ["postgres", "queue"],   // other services[].id
@@ -753,7 +755,59 @@ with greyed dependents instead of nine red alerts. `critical: false` is for what
 is allowed to be down at 3am. `startedAt` is what lets a consumer tell a memory
 leak from a restart sawtooth.
 
-### 9.1 Sub-services
+`kind: "thirdParty"` means somebody else operates it. That is a fact about who
+gets called at 3am, and says nothing about who is hurt — that is `audience`, and
+a third-party service the product runs on is `audience: "external"`.
+
+### 9.1 `audience` — who feels it when this breaks
+
+Every service is `external` or `internal`, and the test is **who is hurt, not who
+connects**.
+
+- **`external`** — a failure reaches customers. That covers everything standing
+  in the path of something a customer sees, buys, or waits on, however far back
+  it sits. A worker no customer has heard of, whose output is every screen the
+  product renders, is external. So is the queue feeding it and the database under
+  that.
+- **`internal`** — a failure is felt only by the people who run the business.
+  Development and operations machinery: build and release pipelines, model
+  retraining, backfills, staging, internal dashboards, admin tooling. Nothing a
+  customer is holding right now depends on it.
+
+Reachability decides nothing. A private worker on a closed network is external
+when its output is in front of customers. A publicly reachable admin console is
+internal when only staff use it.
+
+Long enough down, an internal service does become a customer problem — retraining
+that never runs is a product that quietly gets worse. That is a `warn` that grows,
+and belongs in `message`. It is not a reclassification. Classify by who is hurt
+now.
+
+**Where it is genuinely unclear, write `external`.** A false page costs one person
+an hour. A customer-facing outage filed as internal costs whatever it costs until
+a customer reports it.
+
+There is no `unknown`. The other enums here have one because a check can fail
+(§3); this is a fact about the business, and the business knows it.
+
+**`audience` and `critical` are different questions.** `audience` is who is
+affected. `critical` is how hard this one hits within that group. Together they
+are the severity a consumer should render:
+
+| | `critical: true` | `critical: false` |
+|---|---|---|
+| **`external`** | Page now. Customers are losing something. | Customers are degraded or waiting. Today, not tonight. |
+| **`internal`** | Nobody ships, trains, or deploys until it is fixed. Working hours. | Ticket. |
+
+A row of red is not a severity. Two services `down` — the checkout API and the
+nightly retraining job — are not the same event, and a consumer that renders them
+identically has taught its reader to skim past both.
+
+**An internal service being `down` never makes `status.level` `down`** (§5). That
+level means customers are affected, and by construction none are. It can make it
+`warn`.
+
+### 9.2 Sub-services
 
 `parent` nests a service inside another. Use it when one logical service is
 really N of the same thing and you want both the roll-up and the parts.
@@ -762,7 +816,7 @@ A collection service with one worker per upstream source:
 
 ```jsonc
 { "id": "ingest",            "name": "Data collection", "kind": "worker", "status": "degraded",
-  "critical": true, "message": "1 of 4 sources failing" },
+  "audience": "external", "critical": true, "message": "1 of 4 sources failing" },
 
 { "id": "ingest.source-a",   "name": "Source A", "kind": "worker", "parent": "ingest",
   "status": "up",   "critical": false },
@@ -788,8 +842,13 @@ Rules:
   consumer sum — say which in `note` if it is not obvious.
 - `dependsOn` is for things a service *calls*. `parent` is for what it is *part
   of*. A child may also `dependsOn` a service outside its parent.
-- **A child inherits `hosts` and `serverless` from its parent** unless it sets
-  its own. Four workers in one process do not each repeat the machine.
+- **A child inherits `hosts`, `serverless`, and `audience` from its parent**
+  unless it sets its own. Four workers in one process do not each repeat the
+  machine, and four sources feeding the product do not each restate that
+  customers depend on them. The children above are all `external` by inheritance.
+- **A parent is `external` if any descendant is.** If one child's failure reaches
+  customers, so does the roll-up that contains it. An `internal` parent over an
+  `external` child is a classification error, not a nuance.
 
 ---
 
@@ -1362,7 +1421,7 @@ Runs since the `ci` cursor that did not pass. Successes are a metric
   "source": "monitoring",                // monitoring | deploy | cron | vendor
                                          // | manual | external
   "service": "ingest.source-b",
-  "customerImpact": false,
+  "customerImpact": false,      // an internal service (§9.1) cannot report true
   "count": 3,                            // occurrences since openedAt
   "detail": "Selector change suspected; other three sources unaffected.",
   "url": "https://status.acme.example/i/412"
@@ -1372,6 +1431,11 @@ Runs since the `ci` cursor that did not pass. Successes are a metric
 `id` must be **stable across polls**. Key it on what is broken, never on a
 timestamp or a random id, or the same outage arrives 1,440 times a day and you
 stop reading the list.
+
+`customerImpact` is the per-incident answer; `audience` (§9.1) is the standing one
+about the service. They have to agree: an incident on an `audience: internal`
+service reporting `customerImpact: true` means one of the two is wrong, and
+usually it is the classification.
 
 Keep resolved incidents for 24h so a UI can show a recently-resolved strip, then
 drop them.
@@ -1478,7 +1542,7 @@ dropped buffer (§2) is declared here too.
 |---|---|---|
 | Whole document | 2 MB | Consumer rejects, logs, keeps last good. |
 | `metrics` | 1000 | Truncated, `featured` first. |
-| `services` | 200 | Truncated, `critical` first. |
+| `services` | 200 | Truncated: `external` before `internal`, `critical` before not. |
 | `vendors` | 100 | Truncated, `crit` first. |
 | `accounts` | 50 | Truncated, largest balance first. |
 | `hosts` | 50 | Truncated. |
@@ -1677,7 +1741,8 @@ runs four passes.
 
 **1. Valid.** Required fields present, enums known, ids and timestamps in the §3
 shapes, money integral, ratios in 0–1 unless `signed`, `unitLabel` set whenever
-`unit` is `other`, `window` set on counters and drawn from §6.4, `cohort` present
+`unit` is `other`, `audience` set on every service and one of the two values with
+no `unknown` (§9.1), `window` set on counters and drawn from §6.4, `cohort` present
 on every cohort-basis funnel stage, balance present on `prepaid` and `quota`
 vendors, absent on `postpaid`, and optional on `free` (§10), `usdCents` present
 on every account not denominated in `usd`, and every `url`, `accountUrl`, and
@@ -1706,6 +1771,14 @@ on every account not denominated in `usd`, and every `url`, `accountUrl`, and
   the same period, where both are present.
 - Every account declares a `connection`, and none carries an account number or a
   transaction list.
+- No `audience: external` service has an `internal` ancestor, and none inherits
+  one (§9.2). A customer-facing child under an internal roll-up is the error this
+  catches.
+- No incident whose `service` is `audience: internal` reports
+  `customerImpact: true` (§22).
+- `status.level` is `down` only while some `audience: external` service is
+  `degraded` or `down`, or some incident reports `customerImpact: true`. A
+  business paging itself over its own build pipeline fails this.
 - `incidents.open` equals the unresolved entries in `incidents[]`.
 - `domains.expiring` and `compliance.due` agree with their lists.
 - Every `expected` has `min <= max`.
@@ -1733,7 +1806,10 @@ than visibly broken.
 normal range; both outcomes of `usage.requests` on every operation in `apis[]`;
 `resource.processes` and `resource.orphans` on every non-serverless host;
 `featured` metrics present, at most eight; `generatedAt` recent; every service
-either has a host, inherits one, declares `serverless`, or is `kind: external`.
+either has a host, inherits one, declares `serverless`, or is `kind: thirdParty`;
+every `audience: internal` service says in `name`, `note`, or `message` what it is
+for, since nothing else in the document explains why a red row is not being acted
+on.
 *Warnings* — a business with no revenue is not a malformed business.
 
 **4. Live.** Against a real endpoint:
@@ -1778,7 +1854,8 @@ allowlist has traded the whole of §27 for a green tick.
 ## Appendix A — a complete report
 
 Acme Corp: a paid API with a web app, a self-hosted inference box, a collection
-service with four upstream sources, and the paperwork of a Delaware LLC. Every
+service with four upstream sources, an internal retraining pipeline, and the
+paperwork of a Delaware LLC. Every
 section is populated, every reference resolves, and the numbers agree.
 
 The story it tells: source B has been dead for a day, `POST /v1/export` is
@@ -1791,7 +1868,9 @@ and an LTV only 1.9x its CAC, and $196 of card spend belongs to no tracked
 vendor. The LLM account also runs dry this week and does not appear as a risk,
 because it tops itself up. And since the 17:31 deploy, the database is serving
 three times the reads per request against a flat row count — the shape of an
-index that stopped being used.
+index that stopped being used. The retraining pipeline has been down two days on
+the same full disk, and the report still reads `warn`, because it is `internal`
+and no customer is waiting on it.
 
 ```json
 {
@@ -1825,7 +1904,7 @@ index that stopped being used.
 
   "status": {
     "level": "warn",
-    "summary": "Source B down 37h. /v1/export failing every call. Hourly rollup ran 10x normal. Proxy balance out in 3 days. Orphaned worker on app-01.",
+    "summary": "Source B down 37h. /v1/export failing every call. Hourly rollup ran 10x normal. Proxy balance out in 3 days. Orphaned worker on app-01. Retraining down 2d — internal, so this is warn and not down.",
     "since": "2026-08-25T05:00:00.000Z"
   },
 
@@ -2013,20 +2092,22 @@ index that stopped being used.
   ],
 
   "services": [
-    { "id": "web", "name": "Marketing site and app", "status": "up", "kind": "frontend", "critical": true, "serverless": true, "dependsOn": ["api"], "version": "2.8.0", "startedAt": "2026-08-26T17:31:44.000Z", "checkedAt": "2026-08-26T18:03:58.000Z", "url": "https://acme.example", "env": "prod" },
-    { "id": "api", "name": "Public API", "status": "up", "kind": "api", "critical": true, "serverless": false, "hosts": ["app-01"], "dependsOn": ["postgres", "queue", "inference"], "since": "2026-08-24T09:00:00.000Z", "startedAt": "2026-08-24T09:00:00.000Z", "version": "1.4.2", "checkedAt": "2026-08-26T18:03:58.000Z", "url": "https://api.acme.example", "env": "prod" },
-    { "id": "worker", "name": "Async worker", "status": "degraded", "kind": "worker", "critical": true, "serverless": false, "hosts": ["app-01"], "dependsOn": ["queue", "postgres"], "since": "2026-08-26T17:38:20.000Z", "startedAt": "2026-08-26T17:38:20.000Z", "version": "1.4.2", "message": "Restarted twice in 24h on memory; RSS climbing again.", "checkedAt": "2026-08-26T18:03:58.000Z", "env": "prod" },
-    { "id": "inference", "name": "Inference pool", "status": "up", "kind": "inference", "critical": true, "serverless": false, "hosts": ["gpu-01"], "since": "2026-08-16T02:20:00.000Z", "startedAt": "2026-08-16T02:20:00.000Z", "version": "0.9.4", "message": "1 GPU at 81°C, throttling.", "checkedAt": "2026-08-26T18:03:58.000Z", "env": "prod" },
-    { "id": "postgres", "name": "Postgres", "status": "degraded", "kind": "db", "critical": true, "serverless": false, "hosts": ["app-01"], "since": "2026-08-26T17:34:00.000Z", "message": "Reads per request tripled after web 2.8.0; connection pool near its limit.", "checkedAt": "2026-08-26T18:03:58.000Z", "env": "prod" },
-    { "id": "queue", "name": "Job queue", "status": "up", "kind": "queue", "critical": true, "serverless": true, "checkedAt": "2026-08-26T18:03:58.000Z", "env": "prod" },
+    { "id": "web", "name": "Marketing site and app", "status": "up", "audience": "external", "kind": "frontend", "critical": true, "serverless": true, "dependsOn": ["api"], "version": "2.8.0", "startedAt": "2026-08-26T17:31:44.000Z", "checkedAt": "2026-08-26T18:03:58.000Z", "url": "https://acme.example", "env": "prod" },
+    { "id": "api", "name": "Public API", "status": "up", "audience": "external", "kind": "api", "critical": true, "serverless": false, "hosts": ["app-01"], "dependsOn": ["postgres", "queue", "inference"], "since": "2026-08-24T09:00:00.000Z", "startedAt": "2026-08-24T09:00:00.000Z", "version": "1.4.2", "checkedAt": "2026-08-26T18:03:58.000Z", "url": "https://api.acme.example", "env": "prod" },
+    { "id": "worker", "name": "Async worker", "status": "degraded", "audience": "external", "kind": "worker", "critical": true, "serverless": false, "hosts": ["app-01"], "dependsOn": ["queue", "postgres"], "since": "2026-08-26T17:38:20.000Z", "startedAt": "2026-08-26T17:38:20.000Z", "version": "1.4.2", "message": "Restarted twice in 24h on memory; RSS climbing again.", "checkedAt": "2026-08-26T18:03:58.000Z", "env": "prod" },
+    { "id": "inference", "name": "Inference pool", "status": "up", "audience": "external", "kind": "inference", "critical": true, "serverless": false, "hosts": ["gpu-01"], "since": "2026-08-16T02:20:00.000Z", "startedAt": "2026-08-16T02:20:00.000Z", "version": "0.9.4", "message": "1 GPU at 81°C, throttling.", "checkedAt": "2026-08-26T18:03:58.000Z", "env": "prod" },
+    { "id": "postgres", "name": "Postgres", "status": "degraded", "audience": "external", "kind": "db", "critical": true, "serverless": false, "hosts": ["app-01"], "since": "2026-08-26T17:34:00.000Z", "message": "Reads per request tripled after web 2.8.0; connection pool near its limit.", "checkedAt": "2026-08-26T18:03:58.000Z", "env": "prod" },
+    { "id": "queue", "name": "Job queue", "status": "up", "audience": "external", "kind": "queue", "critical": true, "serverless": true, "checkedAt": "2026-08-26T18:03:58.000Z", "env": "prod" },
 
-    { "id": "ingest", "name": "Data collection", "status": "degraded", "kind": "worker", "critical": true, "serverless": false, "hosts": ["app-01"], "dependsOn": ["postgres", "proxy-gateway"], "since": "2026-08-25T05:00:00.000Z", "message": "1 of 4 sources failing.", "checkedAt": "2026-08-26T18:03:58.000Z", "env": "prod" },
+    { "id": "ingest", "name": "Data collection", "status": "degraded", "audience": "external", "kind": "worker", "critical": true, "serverless": false, "hosts": ["app-01"], "dependsOn": ["postgres", "proxy-gateway"], "since": "2026-08-25T05:00:00.000Z", "message": "1 of 4 sources failing.", "checkedAt": "2026-08-26T18:03:58.000Z", "env": "prod" },
     { "id": "ingest.source-a", "name": "Source A", "status": "up", "kind": "worker", "parent": "ingest", "critical": false, "checkedAt": "2026-08-26T18:03:58.000Z", "env": "prod" },
     { "id": "ingest.source-b", "name": "Source B", "status": "down", "kind": "worker", "parent": "ingest", "critical": false, "since": "2026-08-25T05:00:00.000Z", "message": "0 rows for 3 consecutive runs; selector change suspected.", "checkedAt": "2026-08-26T18:03:58.000Z", "env": "prod" },
     { "id": "ingest.source-c", "name": "Source C", "status": "up", "kind": "worker", "parent": "ingest", "critical": false, "checkedAt": "2026-08-26T18:03:58.000Z", "env": "prod" },
     { "id": "ingest.source-d", "name": "Source D", "status": "up", "kind": "worker", "parent": "ingest", "critical": false, "checkedAt": "2026-08-26T18:03:58.000Z", "env": "prod" },
 
-    { "id": "proxy-gateway", "name": "Proxy gateway", "status": "up", "kind": "external", "critical": false, "checkedAt": "2026-08-26T18:03:58.000Z", "note": "Third party. Depends on the prepaid proxy account." }
+    { "id": "proxy-gateway", "name": "Proxy gateway", "status": "up", "audience": "external", "kind": "thirdParty", "critical": false, "checkedAt": "2026-08-26T18:03:58.000Z", "note": "Third party. Depends on the prepaid proxy account." },
+
+    { "id": "retrain", "name": "Model retraining pipeline", "status": "down", "audience": "internal", "kind": "cron", "critical": false, "serverless": false, "hosts": ["gpu-01"], "dependsOn": ["postgres"], "since": "2026-08-24T22:10:00.000Z", "message": "Last two runs died on the full root disk. The deployed model is unaffected; the next one is late.", "checkedAt": "2026-08-26T18:03:58.000Z", "env": "prod" }
   ],
 
   "vendors": [
@@ -2128,7 +2209,7 @@ index that stopped being used.
       "lastSeenAt": "2026-08-26T18:03:50.000Z", "uptimeSeconds": 4218400,
       "bootedAt": "2026-07-08T14:20:00.000Z", "os": "Ubuntu 24.04", "location": "eu-west" },
     { "id": "gpu-01", "name": "gpu-01", "status": "degraded", "kind": "bare-metal", "role": "inference",
-      "services": ["inference"],
+      "services": ["inference", "retrain"],
       "lastSeenAt": "2026-08-26T18:03:00.000Z", "uptimeSeconds": 918273,
       "bootedAt": "2026-08-16T02:15:00.000Z", "os": "Ubuntu 24.04", "location": "office",
       "note": "Root filesystem at 96% while /data is empty. Top card throttles above 80°C." }
