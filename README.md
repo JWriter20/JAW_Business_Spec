@@ -57,7 +57,7 @@ you went in `cursor.from`.
 |---|---|---|
 | `200` | A report was produced, even a partial one. | Render it. `unavailable[]` becomes a banner. |
 | `401` | Missing or bad token. | Red tile. No retry storm. |
-| `403` | The caller is not on the allowlist (§27). The token was never read. | Red tile, worded differently from `401`. Do not rotate the token. |
+| `403` | The caller is not on the allowlist (§28). The token was never read. | Red tile, worded differently from `401`. Do not rotate the token. |
 | `429` | Rate limited. | Back off, honour `Retry-After`. |
 | `503` | No report is possible at all. | Red tile, keep the last snapshot, mark it stale. |
 
@@ -81,7 +81,7 @@ Sections are one of two kinds, and the kind decides how `since` applies.
 
 | Kind | Sections | `since` |
 |---|---|---|
-| **Snapshot** | `metrics`, `services`, `vendors`, `accounts`, `hosts`, `endpoints`, `sources`, `funnel`, `apis`, `jobs`, `deployments`, `domains`, `compliance`, `incidents` | Ignored. Always current and complete. |
+| **Snapshot** | `metrics`, `services`, `vendors`, `accounts`, `hosts`, `endpoints`, `sources`, `funnel`, `apis`, `actions`, `jobs`, `deployments`, `domains`, `compliance`, `incidents` | Ignored. Always current and complete. |
 | **Stream** | `events`, `errors`, `inbox`, `issues`, `ci` | Return only items after the watermark. |
 
 Each stream is ordered by one timestamp field. That field is what "after the
@@ -121,7 +121,7 @@ first call. Without it a first response cannot say whether it carried 24 hours o
 
 `requestedSince` is the instant the producer **parsed**, not the query string it
 arrived in. Echoing the raw parameter reflects caller-controlled text into a
-document that something else renders (§27, rule 11). Parse it, or return null.
+document that something else renders (§28, rule 11). Parse it, or return null.
 
 ### Rules
 
@@ -147,7 +147,7 @@ document that something else renders (§27, rule 11). Parse it, or return null.
    returned, and sets `cursor.complete: false`. The consumer polls again
    immediately rather than waiting for the next tick.
 
-   `errors` is ranked by `count`, not by time (§18), so the buckets it drops are
+   `errors` is ranked by `count`, not by time (§19), so the buckets it drops are
    not the newest ones and polling again will not bring them back. It advances its
    watermark as usual, sets `complete: false`, and declares the overflow in
    `unavailable[]`. Ranked truncation loses the tail; say so.
@@ -192,21 +192,22 @@ For anything held in memory, such as error counters in a long-lived process:
   "hosts":       [ … ],   // machines we are responsible for        §12
   "endpoints":   [ … ],   // URLs under health check               §13
   "apis":        [ … ],   // every API surface and operation       §14
-  "jobs":        [ … ],   // crons and batches, with normal ranges  §15
-  "deployments": [ … ],   // what is running                       §16
+  "actions":     [ … ],   // work we do, and how long it takes     §15
+  "jobs":        [ … ],   // crons and batches, with normal ranges  §16
+  "deployments": [ … ],   // what is running                       §17
 
-  "events":    [ … ],     // stream: notable things that happened  §17
-  "errors":    [ … ],     // stream: bucketed application errors   §18
-  "inbox":     [ … ],     // stream: new customer mail             §19
-  "issues":    [ … ],     // stream: public repo issues            §20
-  "ci":        [ … ],     // stream: failed CI and test runs       §21
+  "events":    [ … ],     // stream: notable things that happened  §18
+  "errors":    [ … ],     // stream: bucketed application errors   §19
+  "inbox":     [ … ],     // stream: new customer mail             §20
+  "issues":    [ … ],     // stream: public repo issues            §21
+  "ci":        [ … ],     // stream: failed CI and test runs       §22
 
-  "incidents":  [ … ],    // open and recently resolved            §22
-  "domains":    [ … ],    // registrations and expiry              §23
-  "compliance": [ … ],    // filings, registrations, insurance     §24
+  "incidents":  [ … ],    // open and recently resolved            §23
+  "domains":    [ … ],    // registrations and expiry              §24
+  "compliance": [ … ],    // filings, registrations, insurance     §25
 
-  "extra":       { … },   // free-form                             §25
-  "unavailable": [ … ]    // sections this report could not produce §25
+  "extra":       { … },   // free-form                             §26
+  "unavailable": [ … ]    // sections this report could not produce §26
 }
 ```
 
@@ -349,6 +350,7 @@ A metric may name what it is about. All are optional; more than one may be set.
 | `job` | `jobs[].id` | rows processed by the nightly ingest |
 | `endpoint` | `endpoints[].id` | check latency for the health URL |
 | `api` | `apis[].id` | calls to `POST /v1/solve` |
+| `action` | `actions[].id` | how long one unit of work took |
 | `source` | `sources[].id` | signups from the newsletter |
 | `stage` | `funnel[].id` | people who finished onboarding |
 | `instance` | free text, within the scope above | `/data`, `gpu0`, `queue:apply` |
@@ -443,6 +445,26 @@ error.
 | `queue.depth` | `count` | gauge | down_good | Items waiting. |
 | `queue.oldest_age` | `seconds` | gauge | down_good | Age of the oldest waiting item. |
 | `queue.dlq_depth` | `count` | gauge | down_good | Dead-lettered items. |
+
+**Timing** — how long the work itself takes. Scope with `action` (§6.1), and
+with `instance` for the variant.
+
+| id | unit | kind | direction | meaning |
+|---|---|---|---|---|
+| `action.count` | `count` | counter | up_good | Actions that finished in the window. Split with `outcome`. |
+| `action.duration_p50` | `ms` | gauge | down_good | Median from start to finish. |
+| `action.duration_p95` | `ms` | gauge | down_good | p95 from start to finish. |
+| `action.duration_p99` | `ms` | gauge | down_good | p99 from start to finish. |
+| `action.duration_max` | `ms` | gauge | down_good | The slowest one in the window. The honest tail when there are too few runs for a percentile. |
+| `action.wait_p95` | `ms` | gauge | down_good | p95 between accepted and started. Waiting, not working. |
+| `action.inflight` | `count` | gauge | neutral | Started and not finished right now. |
+
+Durations are `ms` whatever the scale, the same as `jobs[].lastRun.durationMs`. A
+step that takes an hour is a large number, not a different unit.
+
+**There is no `action.success_rate`.** `usage.success_rate` and `usage.error_rate`
+take an `action` scope, and so do `usage.units` and `cost.spend` where you can
+attribute them. Only the timings needed ids of their own.
 
 **Reliability**
 
@@ -1147,6 +1169,9 @@ Traffic is metrics scoped with `api` (§6.1):
 | `usage.requests` with `outcome: "success"` and `outcome: "failure"` | required for every operation |
 | `usage.latency_p50`, `usage.latency_p95`, `usage.error_rate` | where you have them |
 
+Latency here is the operation end to end. The steps inside it, and the part of
+it spent waiting on something you do not run, are `actions` (§15).
+
 ### Rules
 
 - **Route templates, never concrete paths.** `/v1/solve/{id}`, not
@@ -1163,7 +1188,7 @@ Traffic is metrics scoped with `api` (§6.1):
 - A surface row's own metrics are that surface's total. Emit them or emit the
   operations, not both, or the totals double.
 - **The metric cap binds before the api cap.** 500 operations reporting both
-  outcomes is the entire 1000-metric budget (§26) and leaves room for nothing
+  outcomes is the entire 1000-metric budget (§27) and leaves room for nothing
   else. Past a couple of hundred operations, report the surfaces and the
   operations that earn their row.
 - **No per-route instrumentation? Report the surfaces.** Per-operation counts
@@ -1177,7 +1202,115 @@ number you already have and cannot act on.
 
 ---
 
-## 15. `jobs` — crons and batches
+## 15. `actions` — the work we do, and how long it takes
+
+One row per kind of work the business performs, one row per step inside it,
+linked by `parent` — the same nesting as `services` (§9.2) and `apis` (§14).
+
+An **action** is a unit of work with a start and an end that the business does
+over and over: a request served, a document processed, a payment settled, a call
+out into somebody else's system. A **subaction** is one step inside an action.
+The timings are the point of the section. A business knows its own throughput
+long before it knows which of the six steps behind a five-second number spends
+four of those seconds, or which counterparty is twice as slow as the rest.
+
+```jsonc
+{
+  "id": "solve",                        // REQUIRED. stable
+  "name": "Solve a challenge",          // REQUIRED
+  "kind": "internal",                   // REQUIRED. internal | outbound | manual
+  "parent": null,                       // the action this one is a step of
+  "service": "api",                     // services[].id that performs it
+  "vendor": null,                       // vendors[].id, when the wait is inside their system
+  "api": "api-public:POST /v1/solve",   // apis[].id, when this is the work behind one operation
+  "job": null,                          // jobs[].id, when a schedule starts it
+  "deadlineMs": 30000,                  // deadline we enforce. null = none
+  "note": null
+}
+```
+
+`kind` is the first thing a reader needs and the one thing they cannot infer:
+`internal` is our code, `outbound` is time spent inside somebody else's system,
+`manual` is a person. A slow `internal` step is a deploy; a slow `outbound` step
+is an email to a vendor. Pair `outbound` with `vendor` and a step that got slower
+lands next to the bill for it.
+
+`deadlineMs` is what turns a flat p99 into a fact. A percentile pinned to exactly
+the deadline is a wall being hit, not a distribution — without the number
+declared, the consumer cannot tell that from work that happens to take that long.
+
+**No `status`.** An action is not a thing that can be up or down; its health is
+its numbers, and the service that performs it already carries a status (§9).
+
+**No `expected` on the row.** Unlike a job (§16), every number about an action is
+a metric, so the normal range goes on the metric — which is also the only place
+it can be right, since p50 and p95 have different normal ranges and one band on
+the row would have to be wrong about one of them.
+
+### Rules
+
+- **`parent` must be another `actions[].id` in the same document. No cycles.**
+  Any depth is legal. Past three, nobody reads the breakdown.
+
+- **Durations nest; counts do not.** Emit the parent's duration *and* every
+  subaction's — a parent's duration is the interval that contains its children,
+  not a sum of rows, so there is nothing to double count. `action.count` follows
+  the usual rule: emit the parent's or the children's, not both, or the same work
+  is counted once per step.
+
+- **Percentiles do not decompose.** The p95 of an action is not the sum of its
+  subactions' p95s — the run that was slowest overall is rarely the run in which
+  any one step was slowest, so stacking stage p95s into a bar draws a run that
+  never happened. Stage timings say which step to go and look at. p50s are close
+  enough to additive to compare; what they leave unaccounted for is queueing,
+  retries, and scheduling, and that gap is worth reading too.
+
+- **Split the timings by outcome.** A failure is either far faster than a success
+  or exactly as long as the deadline, and either poisons a combined percentile —
+  **a timed-out run contributes the deadline, not the work.** Emit
+  `outcome: "success"` and `outcome: "failure"` separately, or emit successes
+  only and say so in `note`. An unsplit p95 that moves cannot tell you whether
+  the work got slower or the failures got more common, which are opposite
+  problems.
+
+- **The same action against a different counterparty is `instance`, not another
+  row.** Where one action runs against several upstreams, integrations,
+  providers, or tenants — and the comparison between them is exactly what you
+  want — keep one action and put the variant in `instance` (§6.1). `actions[]`
+  then stays the size of your code while the cardinality lives in the metrics,
+  where the cap is explicit and the identity tuple already accounts for it. A row
+  per counterparty restates the same description of the work N times and goes
+  stale the first time one is added.
+
+- **Percentiles need volume.** Below a few hundred completions in the window, a
+  p95 is one run wearing a statistic's clothes. Report `action.duration_p50` and
+  `action.duration_max` and skip the rest: the typical one and the worst one is a
+  readable pair, and neither is fabricated.
+
+- **Time what you would change.** The metric cap (§27) binds long before the
+  action cap: one action with four subactions, three percentiles, and two
+  outcomes is thirty rows. Instrument the steps you would actually go and look at
+  — the ones you suspect, the ones you pay for, the ones that cross a boundary
+  you do not control — and leave the rest to a tracing tool. This section is for
+  noticing that something got slower, not for profiling it afterwards.
+
+### What belongs somewhere else
+
+- **A request served on a surface you expose** is `usage.latency_*` scoped with
+  `api` (§14). That is the number, and it does not need an action beside it. Add
+  one when you want the steps behind it, and set `api` so the two join.
+- **The last run of a scheduled thing**, and whether it is late, is `jobs` (§16).
+  `jobs[].lastRun.durationMs` is one run; `action.duration_p50` is the shape of
+  many. Something that runs nightly has one duration a day and belongs only in
+  §16. Something that runs every minute has a distribution, and can have both.
+- **A person moving between funnel stages** over hours or days is
+  `funnel.time_to_convert_p50` (§8).
+- **The probe time for a health URL** is `endpoints[].latencyMs` (§13). That
+  measures the check, not the work.
+
+---
+
+## 16. `jobs` — crons and batches
 
 Point-in-time state of every scheduled thing, plus the range that counts as
 normal.
@@ -1215,9 +1348,13 @@ every check the job itself can make, and is still the most interesting thing tha
 happened last night. `status: "anomalous"` means it finished with numbers outside
 the declared range.
 
+`lastRun` is one run. Where something runs often enough to have a distribution
+rather than a latest value, its timings belong in `actions` (§15) as well, and
+`actions[].job` joins the two.
+
 ---
 
-## 16. `deployments` — what is running
+## 17. `deployments` — what is running
 
 ```jsonc
 {
@@ -1247,7 +1384,7 @@ button say where it is going before you press it.
 
 ---
 
-## 17. `events` — stream: notable things that happened
+## 18. `events` — stream: notable things that happened
 
 Everything a human would want told about after the fact. Only items after the
 `events` cursor.
@@ -1281,7 +1418,7 @@ few hundred times a day it is a metric, not an event.
 
 ---
 
-## 18. `errors` — stream: bucketed application errors
+## 19. `errors` — stream: bucketed application errors
 
 **Grouped, never raw.** One entry per distinct failure, with a count. A thousand
 identical timeouts is one bucket with `count: 1000`.
@@ -1319,7 +1456,7 @@ identical timeouts is one bucket with `count: 1000`.
 
 ---
 
-## 19. `inbox` — stream: new customer mail
+## 20. `inbox` — stream: new customer mail
 
 Every support channel that receives customer messages, in one queue. Items after
 the `inbox` cursor.
@@ -1354,7 +1491,7 @@ answer the question the dashboard is actually asking.
 
 ---
 
-## 20. `issues` — stream: public repository issues
+## 21. `issues` — stream: public repository issues
 
 Links and titles only, and **public repositories only**. Issues opened or
 updated since the `issues` cursor.
@@ -1381,7 +1518,7 @@ Private repositories stay out — their titles leak roadmap and customers.
 
 ---
 
-## 21. `ci` — stream: failed builds and tests
+## 22. `ci` — stream: failed builds and tests
 
 Runs since the `ci` cursor that did not pass. Successes are a metric
 (`ci.pass_rate`), not a list.
@@ -1408,7 +1545,7 @@ Runs since the `ci` cursor that did not pass. Successes are a metric
 
 ---
 
-## 22. `incidents` — open and recently resolved
+## 23. `incidents` — open and recently resolved
 
 ```jsonc
 {
@@ -1442,7 +1579,7 @@ drop them.
 
 ---
 
-## 23. `domains`
+## 24. `domains`
 
 ```jsonc
 {
@@ -1466,7 +1603,7 @@ outage with a date on it. Certificates live on `endpoints[].tls` (§13).
 
 ---
 
-## 24. `compliance` — filings, registrations, insurance
+## 25. `compliance` — filings, registrations, insurance
 
 The paperwork that quietly expires: entity good standing, annual reports,
 franchise tax, registered agent, insurance, licences.
@@ -1496,7 +1633,7 @@ to check. Say it out loud months early.
 
 ---
 
-## 25. `extra` and `unavailable`
+## 26. `extra` and `unavailable`
 
 ```jsonc
 "extra": {
@@ -1525,9 +1662,9 @@ last-good values on. To name one missing number rather than a whole section, add
 
 **`reason` is written for a human, never pasted from an exception.** "billing API
 returned 502" is the whole of it. A caught exception carries internal hostnames,
-connection strings, and stack frames straight into a document §27 promises holds
+connection strings, and stack frames straight into a document §28 promises holds
 none of those, and this field is filled in at exactly the moment somebody is
-reaching for the nearest string. The discipline §18 applies to an error message
+reaching for the nearest string. The discipline §19 applies to an error message
 applies here.
 
 Present means the report is incomplete and says which part. The consumer shows a
@@ -1536,7 +1673,7 @@ dropped buffer (§2) is declared here too.
 
 ---
 
-## 26. Limits
+## 27. Limits
 
 | Thing | Cap | Over the cap |
 |---|---|---|
@@ -1548,6 +1685,7 @@ dropped buffer (§2) is declared here too.
 | `hosts` | 50 | Truncated. |
 | `endpoints` | 100 | Truncated, `down` first. |
 | `apis` | 500 | Truncated, most-called first, surfaces before operations. The metric cap bites first (§14). |
+| `actions` | 200 | Truncated, most time spent first, parents before subactions. The metric cap bites first (§15). |
 | `sources` | 200 | Truncated, most traffic first. |
 | `funnel` | 20 | Truncated from the bottom of the funnel up. |
 | `jobs` | 100 | Truncated, not-`ok` first. |
@@ -1568,7 +1706,7 @@ the query returned first.
 
 **The 2 MB cap is on the decompressed document, and has to be enforced while
 decompressing.** §1 compresses the body, so a consumer that checks the size after
-decompressing has already allocated whatever it was handed (§27, rule 12).
+decompressing has already allocated whatever it was handed (§28, rule 12).
 
 Streams truncate with a watermark (§2, rule 4) and are therefore never lossy —
 except `errors`, which is ranked by `count` and drops its tail. Snapshots
@@ -1576,7 +1714,7 @@ truncate by dropping the least important rows, and are lossy by design.
 
 ---
 
-## 27. Security
+## 28. Security
 
 This document is a complete operational picture of a company behind one bearer
 token, fetched by a machine that holds the same for every other company. Both
@@ -1650,10 +1788,10 @@ Two controls on the way in, in this order: who may connect, then who may read.
 7. **No secrets, no bodies, no PII.** No keys, tokens, passwords, connection
    strings, customer documents, or message bodies. No account, routing, or card
    numbers, and no transaction lists — §11 is balances and totals, and the
-   connection behind it is read-only. Mask email addresses, and see §19 for what
+   connection behind it is read-only. Mask email addresses, and see §20 for what
    an inbox section does still carry and what that costs. Error samples carry
    identifiers, not payloads. Free-text `reason` and `note` strings are written,
-   not pasted from an exception (§25). Private repository issues stay out.
+   not pasted from an exception (§26). Private repository issues stay out.
    The report is cached, logged, and stored on another machine; a backup of that
    machine is a backup of everything you ever put in a report.
 8. **`Cache-Control: no-store`.**
@@ -1690,7 +1828,7 @@ Two controls on the way in, in this order: who may connect, then who may read.
 
     - **Escape on render.** Every text field — `label`, `title`, `summary`,
       `note`, `message`, `snippet`, `name` — is displayed as text, never as
-      markup. `extra` (§25) is arbitrary JSON rendered generically, so its keys
+      markup. `extra` (§26) is arbitrary JSON rendered generically, so its keys
       get the same treatment as its values.
     - **Allow `http` and `https` in URLs, and nothing else.** Every `url`,
       `accountUrl`, and `links[].url` is producer-controlled by definition;
@@ -1703,7 +1841,7 @@ Two controls on the way in, in this order: who may connect, then who may read.
       server-side.** A dashboard that health-checks producer-supplied URLs from
       its own network is an SSRF engine that somebody else configures.
 
-12. **Bound the body before parsing it.** §26's 2 MB cap is on the *decompressed*
+12. **Bound the body before parsing it.** §27's 2 MB cap is on the *decompressed*
     document and §1 compresses the body, so a consumer that measures after
     decompressing has already allocated whatever it was sent. Cap the decompressed
     stream and abort mid-decompression when it is passed, bound nesting depth, and
@@ -1713,18 +1851,19 @@ Two controls on the way in, in this order: who may connect, then who may read.
     per business, in one place. Encrypted at rest, never in a log line, an argv,
     or a crash dump. Do not log response bodies — the report is the thing every
     producer was promised you would not spread — and remember that snapshots
-    inherit all of it: §19's inbox is customer-written text, so a backup of the
+    inherit all of it: §20's inbox is customer-written text, so a backup of the
     dashboard is a backup of every report it has ever stored.
 
 ---
 
-## 28. Versioning
+## 29. Versioning
 
 `spec` is `"jaw-business-report/<major>"`, the major a bare integer — this document
 is `"jaw-business-report/1"`, and that exact string is what §3 requires. Consumers
 accept the current major and the one before it.
 
-**Free within a major:** new optional fields, new registry ids, new enum values.
+**Free within a major:** new optional fields, new optional sections, new registry
+ids, new enum values.
 Consumers ignore unknown keys and read unknown enum values as `unknown`.
 
 **Needs a major bump:** removing or renaming a field, changing a type or unit,
@@ -1734,7 +1873,7 @@ that lies about last month.
 
 ---
 
-## 29. Conformance
+## 30. Conformance
 
 A checker takes a report from a file, or from a live endpoint with a token, and
 runs four passes.
@@ -1742,20 +1881,21 @@ runs four passes.
 **1. Valid.** Required fields present, enums known, ids and timestamps in the §3
 shapes, money integral, ratios in 0–1 unless `signed`, `unitLabel` set whenever
 `unit` is `other`, `audience` set on every service and one of the two values with
-no `unknown` (§9.1), `window` set on counters and drawn from §6.4, `cohort` present
-on every cohort-basis funnel stage, balance present on `prepaid` and `quota`
+no `unknown` (§9.1), `kind` set on every action (§15), `window` set on counters
+and drawn from §6.4, `cohort` present on every cohort-basis funnel stage, balance present on `prepaid` and `quota`
 vendors, absent on `postpaid`, and optional on `free` (§10), `usdCents` present
 on every account not denominated in `usd`, and every `url`, `accountUrl`, and
-`links[].url` an `http` or `https` URL and nothing else (§27, rule 11).
+`links[].url` an `http` or `https` URL and nothing else (§28, rule 11).
 *Errors.*
 
 **2. Consistent.** The document agrees with itself:
 
-- Every `service`, `host`, `vendor`, `job`, `endpoint`, `api`, `source`, `stage`
-  on a metric resolves.
-- Every `services[].parent`, `vendors[].parent`, `apis[].parent`, `dependsOn`,
-  `hosts[].services`, `apis[].service`, and `endpoints[].service` resolves. No
-  parent cycles.
+- Every `service`, `host`, `vendor`, `job`, `endpoint`, `api`, `action`, `source`,
+  `stage` on a metric resolves.
+- Every `services[].parent`, `vendors[].parent`, `apis[].parent`,
+  `actions[].parent`, `dependsOn`, `hosts[].services`, `apis[].service`,
+  `actions[].service`, `actions[].vendor`, `actions[].api`, `actions[].job`, and
+  `endpoints[].service` resolves. No parent cycles.
 - The metric identity tuple (§6.1) is unique.
 - Every registry metric id carries the registry's unit, and a `direction` that is
   the registry's, its inverse where `outcome` is `failure`, or `neutral` (§6.2).
@@ -1775,13 +1915,19 @@ on every account not denominated in `usd`, and every `url`, `accountUrl`, and
   one (§9.2). A customer-facing child under an internal roll-up is the error this
   catches.
 - No incident whose `service` is `audience: internal` reports
-  `customerImpact: true` (§22).
+  `customerImpact: true` (§23).
 - `status.level` is `down` only while some `audience: external` service is
   `degraded` or `down`, or some incident reports `customerImpact: true`. A
   business paging itself over its own build pipeline fails this.
 - `incidents.open` equals the unresolved entries in `incidents[]`.
 - `domains.expiring` and `compliance.due` agree with their lists.
 - Every `expected` has `min <= max`.
+- An action's duration percentiles are ordered — p50 ≤ p95 ≤ p99 ≤
+  `action.duration_max` — within one scope, window, and outcome.
+- No subaction reports a duration above its parent's at the same percentile,
+  window, and outcome. A step cannot take longer than the thing that contains it,
+  and when it does, one of the two is measuring something other than what it says
+  (§15).
 - Where an operation reports both outcomes and `usage.error_rate`, the rate
   matches the counts within 1% relative.
 - `funnel[].position` values are unique. Where a stage reports
@@ -1804,12 +1950,14 @@ than visibly broken.
 **3. Complete.** The five recommended metrics (§6.2) present; `direction` set;
 `expected` on jobs, on `resource.processes`, and on any metric with a known
 normal range; both outcomes of `usage.requests` on every operation in `apis[]`;
-`resource.processes` and `resource.orphans` on every non-serverless host;
-`featured` metrics present, at most eight; `generatedAt` recent; every service
-either has a host, inherits one, declares `serverless`, or is `kind: thirdParty`;
-every `audience: internal` service says in `name`, `note`, or `message` what it is
-for, since nothing else in the document explains why a red row is not being acted
-on.
+`action.count` on every root action reporting a duration percentile, since a
+percentile over an unknown number of runs cannot be read, and subactions are
+covered by their parent's count (§15); `resource.processes` and
+`resource.orphans` on every non-serverless host; `featured` metrics present, at
+most eight; `generatedAt` recent; every service either has a host, inherits one,
+declares `serverless`, or is `kind: thirdParty`; every `audience: internal`
+service says in `name`, `note`, or `message` what it is for, since nothing else
+in the document explains why a red row is not being acted on.
 *Warnings* — a business with no revenue is not a malformed business.
 
 **4. Live.** Against a real endpoint:
@@ -1828,7 +1976,7 @@ on.
   `401` and the `403`. A preflight `OPTIONS` is not answered permissively.
 - **Rotation overlap.** With a second token configured, both the outgoing and the
   incoming token return `200`. A deployment that accepts only one token cannot be
-  rotated without an outage, so it will not be rotated (§27, rule 4).
+  rotated without an outage, so it will not be rotated (§28, rule 4).
 - **Cursor round trip:** call once, send `cursor.streams` back immediately, and
   confirm the watermarks come back equal or later and no `events`, `inbox`, or
   `ci` item repeats. `errors` and `issues` may legitimately return the same id
@@ -1836,7 +1984,7 @@ on.
   catches the race in §2: a producer stamping watermarks from a single "now"
   fails it.
 
-**Passes 1–4 check a producer.** The consumer is the other half of §27 and needs
+**Passes 1–4 check a producer.** The consumer is the other half of §28 and needs
 its own fixtures: a report carrying a `javascript:` URL, a `note` full of markup,
 an id with a quote in it, and a body that decompresses past 2 MB. Each must be
 rendered inert, stored safely, or rejected — never trusted because the schema
@@ -1847,7 +1995,7 @@ in each business's CI — a refactor that drops a metric should fail a pull requ
 not quietly blank a chart. **Pass 4 cannot run in CI**, because a hosted runner's
 egress address is not on the allowlist and never should be. Run it from the
 consumer's own machine on a schedule. A red build "fixed" by widening the
-allowlist has traded the whole of §27 for a green tick.
+allowlist has traded the whole of §28 for a green tick.
 
 ---
 
@@ -2079,6 +2227,38 @@ and no customer is waiting on it.
     { "id": "usage.requests", "label": "POST /hooks/payments — succeeded", "value": 214, "unit": "count", "kind": "counter", "window": "1h", "api": "api-hooks:POST /hooks/payments", "outcome": "success", "group": "API", "direction": "up_good" },
     { "id": "usage.requests", "label": "POST /hooks/payments — failed", "value": 6, "unit": "count", "kind": "counter", "window": "1h", "api": "api-hooks:POST /hooks/payments", "outcome": "failure", "group": "API", "direction": "down_good", "note": "Six retried deliveries from the payment processor. Same batch as the failed renewals." },
 
+    { "id": "action.count", "label": "Solves — succeeded", "value": 34042, "unit": "count", "kind": "counter", "window": "1h", "action": "solve", "outcome": "success", "group": "Actions", "direction": "up_good" },
+    { "id": "action.count", "label": "Solves — failed", "value": 126, "unit": "count", "kind": "counter", "window": "1h", "action": "solve", "outcome": "failure", "group": "Actions", "direction": "down_good" },
+    { "id": "action.inflight", "label": "Solves in flight", "value": 29, "unit": "count", "kind": "gauge", "action": "solve", "group": "Actions", "direction": "neutral" },
+    { "id": "action.wait_p95", "label": "Solve queue wait p95", "value": 41, "unit": "ms", "kind": "gauge", "window": "5m", "action": "solve", "group": "Actions", "direction": "down_good" },
+    { "id": "action.duration_p50", "label": "Solve p50", "value": 210, "unit": "ms", "kind": "gauge", "window": "5m", "action": "solve", "outcome": "success", "group": "Actions", "direction": "down_good" },
+    { "id": "action.duration_p95", "label": "Solve p95", "value": 486, "unit": "ms", "kind": "gauge", "window": "5m", "action": "solve", "outcome": "success", "group": "Actions", "direction": "down_good", "expected": { "min": 150, "max": 400 }, "severity": "warn" },
+    { "id": "action.duration_p99", "label": "Solve p99", "value": 1180, "unit": "ms", "kind": "gauge", "window": "5m", "action": "solve", "outcome": "success", "group": "Actions", "direction": "down_good" },
+    { "id": "action.duration_p50", "label": "Solve — fetch asset p50", "value": 38, "unit": "ms", "kind": "gauge", "window": "5m", "action": "solve.fetch", "outcome": "success", "group": "Actions", "direction": "down_good" },
+    { "id": "action.duration_p95", "label": "Solve — fetch asset p95", "value": 96, "unit": "ms", "kind": "gauge", "window": "5m", "action": "solve.fetch", "outcome": "success", "group": "Actions", "direction": "down_good" },
+    { "id": "action.duration_p50", "label": "Solve — preprocess p50", "value": 12, "unit": "ms", "kind": "gauge", "window": "5m", "action": "solve.preprocess", "outcome": "success", "group": "Actions", "direction": "down_good" },
+    { "id": "action.duration_p95", "label": "Solve — preprocess p95", "value": 22, "unit": "ms", "kind": "gauge", "window": "5m", "action": "solve.preprocess", "outcome": "success", "group": "Actions", "direction": "down_good" },
+    { "id": "action.duration_p50", "label": "Solve — inference p50", "value": 118, "unit": "ms", "kind": "gauge", "window": "5m", "action": "solve.infer", "outcome": "success", "group": "Actions", "direction": "down_good" },
+    { "id": "action.duration_p95", "label": "Solve — inference p95", "value": 302, "unit": "ms", "kind": "gauge", "window": "5m", "action": "solve.infer", "outcome": "success", "group": "Actions", "direction": "down_good", "expected": { "min": 60, "max": 180 }, "severity": "warn", "note": "The whole of the solve regression is this step. Same model, throttled card." },
+    { "id": "action.duration_p50", "label": "Solve — persist p50", "value": 34, "unit": "ms", "kind": "gauge", "window": "5m", "action": "solve.persist", "outcome": "success", "group": "Actions", "direction": "down_good" },
+    { "id": "action.duration_p95", "label": "Solve — persist p95", "value": 88, "unit": "ms", "kind": "gauge", "window": "5m", "action": "solve.persist", "outcome": "success", "group": "Actions", "direction": "down_good", "expected": { "min": 5, "max": 40 }, "severity": "warn", "note": "Waiting on the pool. Same cause as db.reads_per_request." },
+
+    { "id": "action.count", "label": "Exports — succeeded", "value": 0, "unit": "count", "kind": "counter", "window": "1h", "action": "export", "outcome": "success", "group": "Actions", "direction": "up_good", "severity": "crit" },
+    { "id": "action.count", "label": "Exports — failed", "value": 18, "unit": "count", "kind": "counter", "window": "1h", "action": "export", "outcome": "failure", "group": "Actions", "direction": "down_good", "severity": "crit" },
+    { "id": "action.duration_p95", "label": "Export p95 — failed", "value": 5000, "unit": "ms", "kind": "gauge", "window": "1h", "action": "export", "outcome": "failure", "group": "Actions", "direction": "down_good", "severity": "crit", "note": "Exactly deadlineMs. Nothing is finishing; every call is being cut off." },
+    { "id": "action.duration_p95", "label": "Export — upload p95 — failed", "value": 4980, "unit": "ms", "kind": "gauge", "window": "1h", "action": "export.upload", "outcome": "failure", "group": "Actions", "direction": "down_good", "severity": "crit", "note": "The whole deadline is spent in the object store. Nothing before it is slow." },
+
+    { "id": "action.count", "label": "Collections — Source A", "value": 4, "unit": "count", "kind": "counter", "window": "24h", "action": "collect", "instance": "source-a", "outcome": "success", "group": "Ingest", "direction": "up_good" },
+    { "id": "action.count", "label": "Collections — Source B", "value": 4, "unit": "count", "kind": "counter", "window": "24h", "action": "collect", "instance": "source-b", "outcome": "failure", "group": "Ingest", "direction": "down_good", "severity": "crit" },
+    { "id": "action.count", "label": "Collections — Source C", "value": 4, "unit": "count", "kind": "counter", "window": "24h", "action": "collect", "instance": "source-c", "outcome": "success", "group": "Ingest", "direction": "up_good" },
+    { "id": "action.count", "label": "Collections — Source D", "value": 4, "unit": "count", "kind": "counter", "window": "24h", "action": "collect", "instance": "source-d", "outcome": "success", "group": "Ingest", "direction": "up_good" },
+    { "id": "action.duration_p50", "label": "Collect p50 — Source A", "value": 244000, "unit": "ms", "kind": "gauge", "window": "24h", "action": "collect", "instance": "source-a", "group": "Ingest", "direction": "down_good" },
+    { "id": "action.duration_p50", "label": "Collect p50 — Source B", "value": 1900, "unit": "ms", "kind": "gauge", "window": "24h", "action": "collect", "instance": "source-b", "group": "Ingest", "direction": "down_good", "expected": { "min": 120000, "max": 400000 }, "severity": "crit", "note": "Two seconds, not four minutes. It is not collecting slowly, it is finishing immediately with nothing." },
+    { "id": "action.duration_p50", "label": "Collect p50 — Source C", "value": 388000, "unit": "ms", "kind": "gauge", "window": "24h", "action": "collect", "instance": "source-c", "group": "Ingest", "direction": "down_good" },
+    { "id": "action.duration_p50", "label": "Collect p50 — Source D", "value": 201000, "unit": "ms", "kind": "gauge", "window": "24h", "action": "collect", "instance": "source-d", "group": "Ingest", "direction": "down_good" },
+    { "id": "action.duration_max", "label": "Collect slowest — Source C", "value": 602000, "unit": "ms", "kind": "gauge", "window": "24h", "action": "collect", "instance": "source-c", "group": "Ingest", "direction": "down_good", "note": "Ten minutes for the worst of four runs. Four a day is too few for a p95." },
+    { "id": "action.duration_max", "label": "Collect slowest — Source A", "value": 291000, "unit": "ms", "kind": "gauge", "window": "24h", "action": "collect", "instance": "source-a", "group": "Ingest", "direction": "down_good" },
+
     { "id": "cost.spend", "label": "Spend — API", "value": 49000, "unit": "usd_cents", "kind": "counter", "window": "30d", "service": "api", "group": "Cost", "direction": "down_good" },
     { "id": "cost.spend", "label": "Spend — inference", "value": 70000, "unit": "usd_cents", "kind": "counter", "window": "30d", "service": "inference", "group": "Cost", "direction": "down_good" },
     { "id": "cost.spend", "label": "Spend — ingest", "value": 21550, "unit": "usd_cents", "kind": "counter", "window": "30d", "service": "ingest", "group": "Cost", "direction": "down_good" },
@@ -2296,6 +2476,30 @@ and no customer is waiting on it.
     { "id": "api-hooks:POST /hooks/payments", "name": "Payment processor callbacks", "parent": "api-hooks",
       "service": "api", "method": "POST", "path": "/hooks/payments", "kind": "webhook", "auth": "signature",
       "visibility": "partner", "status": "up" }
+  ],
+
+  "actions": [
+    { "id": "solve", "name": "Solve a challenge", "kind": "internal", "service": "api",
+      "api": "api-public:POST /v1/solve", "deadlineMs": 30000,
+      "note": "Durations are successes only; the failure count is reported beside them." },
+    { "id": "solve.fetch", "name": "Fetch the challenge asset", "kind": "outbound", "parent": "solve",
+      "service": "api", "note": "Whatever host the caller pointed us at. Not a vendor we pay." },
+    { "id": "solve.preprocess", "name": "Decode and normalise", "kind": "internal", "parent": "solve",
+      "service": "api" },
+    { "id": "solve.infer", "name": "Model inference", "kind": "internal", "parent": "solve",
+      "service": "inference", "note": "One of the two cards is throttling at 81°C." },
+    { "id": "solve.persist", "name": "Write the result", "kind": "internal", "parent": "solve",
+      "service": "postgres" },
+
+    { "id": "export", "name": "Build an export", "kind": "internal", "service": "api",
+      "api": "api-public:POST /v1/export", "deadlineMs": 5000 },
+    { "id": "export.upload", "name": "Upload to the object store", "kind": "outbound", "parent": "export",
+      "service": "api", "vendor": "cloud.storage",
+      "note": "Every attempt since 17:05 has ended at the deadline." },
+
+    { "id": "collect", "name": "Collect from one source", "kind": "outbound", "service": "ingest",
+      "job": "nightly-ingest", "vendor": "proxy", "deadlineMs": 900000,
+      "note": "One row for all four sources; the source is the metric's instance. Four runs a day is too few for a percentile, so p50 and max only." }
   ],
 
   "jobs": [
