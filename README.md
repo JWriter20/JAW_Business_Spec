@@ -57,7 +57,7 @@ you went in `cursor.from`.
 |---|---|---|
 | `200` | A report was produced, even a partial one. | Render it. `unavailable[]` becomes a banner. |
 | `401` | Missing or bad token. | Red tile. No retry storm. |
-| `403` | The caller is not on the allowlist (§28). The token was never read. | Red tile, worded differently from `401`. Do not rotate the token. |
+| `403` | The caller is not on the allowlist (§29). The token was never read. | Red tile, worded differently from `401`. Do not rotate the token. |
 | `429` | Rate limited. | Back off, honour `Retry-After`. |
 | `503` | No report is possible at all. | Red tile, keep the last snapshot, mark it stale. |
 
@@ -121,7 +121,7 @@ first call. Without it a first response cannot say whether it carried 24 hours o
 
 `requestedSince` is the instant the producer **parsed**, not the query string it
 arrived in. Echoing the raw parameter reflects caller-controlled text into a
-document that something else renders (§28, rule 11). Parse it, or return null.
+document that something else renders (§29, rule 11). Parse it, or return null.
 
 ### Rules
 
@@ -205,9 +205,10 @@ For anything held in memory, such as error counters in a long-lived process:
   "incidents":  [ … ],    // open and recently resolved            §23
   "domains":    [ … ],    // registrations and expiry              §24
   "compliance": [ … ],    // filings, registrations, insurance     §25
+  "credentials":[ … ],    // the keys, and when they stop working  §26
 
-  "extra":       { … },   // free-form                             §26
-  "unavailable": [ … ]    // sections this report could not produce §26
+  "extra":       { … },   // free-form                             §27
+  "unavailable": [ … ]    // sections this report could not produce §27
 }
 ```
 
@@ -587,6 +588,8 @@ with a `note` beats an omission, and no breakdown at all is fine.
 | `issues.open` | `count` | gauge | neutral | Open issues on public repos. |
 | `domains.expiring` | `count` | gauge | down_good | Domains with status `expiring` or `expired`, plus endpoints whose TLS certificate has 30 days or less left. |
 | `compliance.due` | `count` | gauge | down_good | Entries in `compliance[]` with status `due` or `overdue`. |
+| `credentials.expiring` | `count` | gauge | down_good | Entries in `credentials[]` with status `expiring` or `expired`. |
+| `credentials.perpetual` | `count` | gauge | down_good | Entries in `credentials[]` with no expiry at all. |
 
 #### Recommended
 
@@ -1188,7 +1191,7 @@ it spent waiting on something you do not run, are `actions` (§15).
 - A surface row's own metrics are that surface's total. Emit them or emit the
   operations, not both, or the totals double.
 - **The metric cap binds before the api cap.** 500 operations reporting both
-  outcomes is the entire 1000-metric budget (§27) and leaves room for nothing
+  outcomes is the entire 1000-metric budget (§28) and leaves room for nothing
   else. Past a couple of hundred operations, report the surfaces and the
   operations that earn their row.
 - **No per-route instrumentation? Report the surfaces.** Per-operation counts
@@ -1287,7 +1290,7 @@ the row would have to be wrong about one of them.
   `action.duration_max` and skip the rest: the typical one and the worst one is a
   readable pair, and neither is fabricated.
 
-- **Time what you would change.** The metric cap (§27) binds long before the
+- **Time what you would change.** The metric cap (§28) binds long before the
   action cap: one action with four subactions, three percentiles, and two
   outcomes is thirty rows. Instrument the steps you would actually go and look at
   — the ones you suspect, the ones you pay for, the ones that cross a boundary
@@ -1633,7 +1636,141 @@ to check. Say it out loud months early.
 
 ---
 
-## 26. `extra` and `unavailable`
+## 26. `credentials` — the keys, and when they stop working
+
+Every token the business runs on: the npm token that publishes the package, the
+GitHub PAT that CI authenticates with, deploy keys, cloud and vendor API keys,
+signing keys, and the bearer token in front of this endpoint. Each one has a date
+on it — or, worse, does not.
+
+Nothing else in this document tells you a credential is about to expire. The
+provider knows and will not call. The failure, when it arrives, is total,
+instant, and dated months in advance: releases stop, CI goes red on every branch
+at once, an integration starts returning `401` and the report says the vendor is
+down. All of it was on a calendar nobody was holding.
+
+**Metadata only. Never the credential.**
+
+```jsonc
+{
+  "id": "npm-publish-ci",                    // REQUIRED. stable
+  "name": "npm publish — release CI",        // REQUIRED
+  "provider": "npm",                         // REQUIRED. who issued it.
+                                             // lowercase slug: npm | github | aws
+                                             // | stripe | cloudflare | …
+  "kind": "token",                           // REQUIRED. token | apiKey | oauth
+                                             // | deployKey | sshKey | certificate
+                                             // | webhookSecret | password | other
+  "write": true,                             // REQUIRED. can it change anything
+  "status": "expiring",                      // REQUIRED. ok | expiring | expired
+                                             //           | perpetual | unknown
+  "expiresAt": "2026-09-20T00:00:00.000Z",   // null only when perpetual or unknown
+  "daysRemaining": 13,
+  "createdAt": "2026-03-24T00:00:00.000Z",
+  "lastUsedAt": "2026-09-06T04:10:00.000Z",  // null = the provider has never seen it used
+  "maxAgeDays": 180,                         // your rotation policy, if you have one
+  "rotation": "manual",                      // auto | manual | none
+  "scopes": ["publish"],                     // as the provider names them
+  "vendor": null,                            // vendors[].id the credential belongs to
+  "services": [],                            // services[].id that stop when it expires
+  "owner": "release-eng",                    // the team or role that holds it
+  "accountUrl": "https://www.npmjs.com/settings/acme/tokens",
+  "asOf": "2026-08-26T18:03:40.000Z",
+  "note": "Publishes @acme/client. Releases fail; nothing serving stops."
+}
+```
+
+### What must never appear here
+
+Not the credential. Not four characters of it, not its prefix, not its suffix,
+not a fingerprint or a hash of it. And not the directions to it either: no
+environment variable name, no host, no file path, no vault path, no recovery
+codes. `note` is a sentence about consequences, never a location.
+
+None of it is needed. A reminder needs a name and a date. The consumer that
+renders this holds a bearer token for every other business it polls (§29), and
+this report is cached, logged, and backed up on its machine — so an inventory of
+which host holds which key under which variable is a map, and it is a map you
+wrote for them.
+
+*But I need to know where it lives to rotate it* is true, and it belongs in the
+runbook, on the machine that already holds the secret. It does not belong in the
+document you hand to a dashboard.
+
+Nothing in this section is a security control. §29 is. This section exists so
+that a date arrives before an outage does.
+
+### `status`
+
+| Value | When |
+|---|---|
+| `ok` | It expires, and the date is beyond the reminder window. |
+| `expiring` | Inside the reminder window — 30 days, unless you set a wider one. |
+| `expired` | Past `expiresAt`. Something is already broken, or is about to be. |
+| `perpetual` | No expiry exists. `expiresAt` is null. |
+| `unknown` | The provider does not say, or the lookup failed. |
+
+**`perpetual` is not the healthy state. It is the reason this section exists.** A
+credential with no expiry is one you will never be reminded about: it cannot be
+aged out, cannot lapse quietly on a Sunday, and outlives the contractor, the
+laptop, and the CI provider it was minted for. §29 rule 4 makes this point about
+this endpoint's own bearer token; it is true of every other key you hold. Count
+them (`credentials.perpetual`), give each an `owner` and a `maxAgeDays`, and let
+a calendar do what the provider never will.
+
+**A date you cannot read is `unknown`, never `ok`.** Do not infer an expiry from
+a creation date and a policy you think the provider applies.
+
+### `write` — what it costs when this one leaks
+
+Required, and there is no `unknown`: either it can change something or it cannot,
+and if nobody can say, the answer is `true`. It is the blast radius in one field.
+An expiring read-only key breaks a dashboard. An expiring publish key breaks
+every release. The same asymmetry decides how bad a leak is, and which of these
+you should be rotating on a schedule rather than on an expiry notice.
+
+§29 rule 10 requires every credential *this report is assembled from* to be
+read-only. The business holds plenty of others that are not, and those are
+exactly the ones nobody dares rotate in a hurry — which is why they need the
+warning earliest.
+
+### `lastUsedAt`
+
+A credential nothing has used in six months is not a rotation problem. It is an
+extra key in the world, held by a service that no longer needs it, and revoking
+it costs nothing. This is the field that finds it, and it is the only cleanup in
+this document that makes you strictly safer for free.
+
+### Rules
+
+1. **One entry per credential, not per provider.** Three GitHub tokens are three
+   entries. They expire on three dates and leak separately.
+2. **The entry is the slot, not the string.** Rotating the npm publish token
+   keeps the same `id` and moves `createdAt` and `expiresAt` forward. The
+   consumer's history then shows one slot rotated on schedule for two years,
+   rather than fourteen credentials that each appeared once and vanished. A
+   credential you revoke and do not replace leaves the list.
+3. **Include this endpoint's own bearer token.** §29 rule 4 already requires you
+   to know its age, and requires two of them to be valid at once while you
+   rotate. That window is the one time a slot is two entries rather than one
+   (rule 2) — the outgoing token and the incoming one, two `expiresAt` dates —
+   and the old entry leaves when the token is dropped. A slot that never shows
+   the window is a slot nobody is rotating.
+4. **`services` is what stops, not what uses it.** A publish token that blocks
+   releases without taking anything down lists no services and says so in `note`.
+   An expiry that ends a running service is a different alarm and should read
+   like one.
+5. **Populate it by hand if you must.** Most providers will not tell you what
+   they hold, and a hand-maintained list with an honest `asOf` (§3) beats an
+   omitted section by the whole width of the outage.
+
+The consumer's job here is a calendar, not a graph: sort by `expiresAt`, warn on
+`expiring`, alarm on `expired`, and list the `perpetual` ones where somebody has
+to look at them.
+
+---
+
+## 27. `extra` and `unavailable`
 
 ```jsonc
 "extra": {
@@ -1662,7 +1799,7 @@ last-good values on. To name one missing number rather than a whole section, add
 
 **`reason` is written for a human, never pasted from an exception.** "billing API
 returned 502" is the whole of it. A caught exception carries internal hostnames,
-connection strings, and stack frames straight into a document §28 promises holds
+connection strings, and stack frames straight into a document §29 promises holds
 none of those, and this field is filled in at exactly the moment somebody is
 reaching for the nearest string. The discipline §19 applies to an error message
 applies here.
@@ -1673,7 +1810,7 @@ dropped buffer (§2) is declared here too.
 
 ---
 
-## 27. Limits
+## 28. Limits
 
 | Thing | Cap | Over the cap |
 |---|---|---|
@@ -1698,6 +1835,7 @@ dropped buffer (§2) is declared here too.
 | `incidents` | 100 | Truncated, `crit` first. |
 | `domains` | 200 | Truncated, soonest expiry first. |
 | `compliance` | 100 | Truncated, soonest due first. |
+| `credentials` | 200 | Truncated, soonest expiry first, then `perpetual`, then `unknown`. |
 | Any string | 2000 chars | Truncated. |
 | `snippet`, `message` | 500 chars | Truncated. |
 
@@ -1706,7 +1844,7 @@ the query returned first.
 
 **The 2 MB cap is on the decompressed document, and has to be enforced while
 decompressing.** §1 compresses the body, so a consumer that checks the size after
-decompressing has already allocated whatever it was handed (§28, rule 12).
+decompressing has already allocated whatever it was handed (§29, rule 12).
 
 Streams truncate with a watermark (§2, rule 4) and are therefore never lossy —
 except `errors`, which is ranked by `count` and drops its tail. Snapshots
@@ -1714,7 +1852,7 @@ truncate by dropping the least important rows, and are lossy by design.
 
 ---
 
-## 28. Security
+## 29. Security
 
 This document is a complete operational picture of a company behind one bearer
 token, fetched by a machine that holds the same for every other company. Both
@@ -1774,7 +1912,8 @@ Two controls on the way in, in this order: who may connect, then who may read.
    done again. One token per business, never shared across companies, each
    separate from any credential that can spend money or write. Give them a max
    age and record when each was issued: a bearer token with no expiry is a
-   permanent credential whose provenance everybody has forgotten.
+   permanent credential whose provenance everybody has forgotten. Report it in
+   `credentials[]` (§26), like every other key you hold.
 5. **Machine to machine. Send no CORS headers.** No `Access-Control-Allow-Origin`,
    no cookie or session auth, ever. A browser that can call this endpoint
    directly is a browser holding the bearer token in JavaScript, where one XSS
@@ -1786,12 +1925,15 @@ Two controls on the way in, in this order: who may connect, then who may read.
    listener bound to loopback and reached through SSH or a VPN, where the tunnel
    is the transport security. Never a plaintext port on a public interface.
 7. **No secrets, no bodies, no PII.** No keys, tokens, passwords, connection
-   strings, customer documents, or message bodies. No account, routing, or card
+   strings, customer documents, or message bodies. §26 lists credentials by
+   name, owner, and expiry date and never by value — not a prefix, not a
+   fingerprint, not the variable it is read from — and that list of exclusions
+   is exhaustive, checked, and the reason that section is safe to publish. No account, routing, or card
    numbers, and no transaction lists — §11 is balances and totals, and the
    connection behind it is read-only. Mask email addresses, and see §20 for what
    an inbox section does still carry and what that costs. Error samples carry
    identifiers, not payloads. Free-text `reason` and `note` strings are written,
-   not pasted from an exception (§26). Private repository issues stay out.
+   not pasted from an exception (§27). Private repository issues stay out.
    The report is cached, logged, and stored on another machine; a backup of that
    machine is a backup of everything you ever put in a report.
 8. **`Cache-Control: no-store`.**
@@ -1828,7 +1970,7 @@ Two controls on the way in, in this order: who may connect, then who may read.
 
     - **Escape on render.** Every text field — `label`, `title`, `summary`,
       `note`, `message`, `snippet`, `name` — is displayed as text, never as
-      markup. `extra` (§26) is arbitrary JSON rendered generically, so its keys
+      markup. `extra` (§27) is arbitrary JSON rendered generically, so its keys
       get the same treatment as its values.
     - **Allow `http` and `https` in URLs, and nothing else.** Every `url`,
       `accountUrl`, and `links[].url` is producer-controlled by definition;
@@ -1841,7 +1983,7 @@ Two controls on the way in, in this order: who may connect, then who may read.
       server-side.** A dashboard that health-checks producer-supplied URLs from
       its own network is an SSRF engine that somebody else configures.
 
-12. **Bound the body before parsing it.** §27's 2 MB cap is on the *decompressed*
+12. **Bound the body before parsing it.** §28's 2 MB cap is on the *decompressed*
     document and §1 compresses the body, so a consumer that measures after
     decompressing has already allocated whatever it was sent. Cap the decompressed
     stream and abort mid-decompression when it is passed, bound nesting depth, and
@@ -1856,7 +1998,7 @@ Two controls on the way in, in this order: who may connect, then who may read.
 
 ---
 
-## 29. Versioning
+## 30. Versioning
 
 `spec` is `"jaw-business-report/<major>"`, the major a bare integer — this document
 is `"jaw-business-report/1"`, and that exact string is what §3 requires. Consumers
@@ -1873,7 +2015,7 @@ that lies about last month.
 
 ---
 
-## 30. Conformance
+## 31. Conformance
 
 A checker takes a report from a file, or from a live endpoint with a token, and
 runs four passes.
@@ -1885,7 +2027,20 @@ no `unknown` (§9.1), `kind` set on every action (§15), `window` set on counter
 and drawn from §6.4, `cohort` present on every cohort-basis funnel stage, balance present on `prepaid` and `quota`
 vendors, absent on `postpaid`, and optional on `free` (§10), `usdCents` present
 on every account not denominated in `usd`, and every `url`, `accountUrl`, and
-`links[].url` an `http` or `https` URL and nothing else (§28, rule 11).
+`links[].url` an `http` or `https` URL and nothing else (§29, rule 11),
+`provider`, `kind`, `write`, and `status` set on every credential with no
+`unknown` for `write`, `expiresAt` present whenever a credential's status is
+`ok`, `expiring`, or `expired`, and null when it is `perpetual` (§26).
+*Errors.*
+
+**And no credential material anywhere in the document.** Reject any
+`credentials[]` entry carrying a field named `value`, `secret`, `token`, `key`,
+`prefix`, `fingerprint`, `hash`, `last4`, `envVar`, `path`, or `host`, and scan
+every string in the whole report — `note`, `summary`, `message`, `snippet`, and
+all of `extra` — for the shapes providers stamp on their own keys: `ghp_`,
+`github_pat_`, `gho_`, `npm_`, `sk-`, `sk_live_`, `AKIA`, `xoxb-`, `-----BEGIN`.
+The scan is not the control; §29 is. It is the smoke alarm over the one field
+somebody will paste a key into at 3 a.m., and the check costs a regex.
 *Errors.*
 
 **2. Consistent.** The document agrees with itself:
@@ -1894,8 +2049,9 @@ on every account not denominated in `usd`, and every `url`, `accountUrl`, and
   `stage` on a metric resolves.
 - Every `services[].parent`, `vendors[].parent`, `apis[].parent`,
   `actions[].parent`, `dependsOn`, `hosts[].services`, `apis[].service`,
-  `actions[].service`, `actions[].vendor`, `actions[].api`, `actions[].job`, and
-  `endpoints[].service` resolves. No parent cycles.
+  `actions[].service`, `actions[].vendor`, `actions[].api`, `actions[].job`,
+  `endpoints[].service`, `credentials[].vendor`, and `credentials[].services`
+  resolves. No parent cycles.
 - The metric identity tuple (§6.1) is unique.
 - Every registry metric id carries the registry's unit, and a `direction` that is
   the registry's, its inverse where `outcome` is `failure`, or `neutral` (§6.2).
@@ -1920,7 +2076,10 @@ on every account not denominated in `usd`, and every `url`, `accountUrl`, and
   `degraded` or `down`, or some incident reports `customerImpact: true`. A
   business paging itself over its own build pipeline fails this.
 - `incidents.open` equals the unresolved entries in `incidents[]`.
-- `domains.expiring` and `compliance.due` agree with their lists.
+- `domains.expiring`, `compliance.due`, `credentials.expiring`, and
+  `credentials.perpetual` agree with their lists.
+- No credential whose `expiresAt` has already passed reports `ok` or `expiring`,
+  and no `perpetual` credential carries an `expiresAt` (§26).
 - Every `expected` has `min <= max`.
 - An action's duration percentiles are ordered — p50 ≤ p95 ≤ p99 ≤
   `action.duration_max` — within one scope, window, and outcome.
@@ -1953,7 +2112,9 @@ normal range; both outcomes of `usage.requests` on every operation in `apis[]`;
 `action.count` on every root action reporting a duration percentile, since a
 percentile over an unknown number of runs cannot be read, and subactions are
 covered by their parent's count (§15); `resource.processes` and
-`resource.orphans` on every non-serverless host; `featured` metrics present, at
+`resource.orphans` on every non-serverless host; `owner` and `lastUsedAt` on
+every credential, and `maxAgeDays` on every `perpetual` one, since nothing else
+in the document will ever raise it (§26); `featured` metrics present, at
 most eight; `generatedAt` recent; every service either has a host, inherits one,
 declares `serverless`, or is `kind: thirdParty`; every `audience: internal`
 service says in `name`, `note`, or `message` what it is for, since nothing else
@@ -1976,7 +2137,7 @@ in the document explains why a red row is not being acted on.
   `401` and the `403`. A preflight `OPTIONS` is not answered permissively.
 - **Rotation overlap.** With a second token configured, both the outgoing and the
   incoming token return `200`. A deployment that accepts only one token cannot be
-  rotated without an outage, so it will not be rotated (§28, rule 4).
+  rotated without an outage, so it will not be rotated (§29, rule 4).
 - **Cursor round trip:** call once, send `cursor.streams` back immediately, and
   confirm the watermarks come back equal or later and no `events`, `inbox`, or
   `ci` item repeats. `errors` and `issues` may legitimately return the same id
@@ -1984,7 +2145,7 @@ in the document explains why a red row is not being acted on.
   catches the race in §2: a producer stamping watermarks from a single "now"
   fails it.
 
-**Passes 1–4 check a producer.** The consumer is the other half of §28 and needs
+**Passes 1–4 check a producer.** The consumer is the other half of §29 and needs
 its own fixtures: a report carrying a `javascript:` URL, a `note` full of markup,
 an id with a quote in it, and a body that decompresses past 2 MB. Each must be
 rendered inert, stored safely, or rejected — never trusted because the schema
@@ -1995,7 +2156,7 @@ in each business's CI — a refactor that drops a metric should fail a pull requ
 not quietly blank a chart. **Pass 4 cannot run in CI**, because a hosted runner's
 egress address is not on the allowlist and never should be. Run it from the
 consumer's own machine on a schedule. A red build "fixed" by widening the
-allowlist has traded the whole of §28 for a green tick.
+allowlist has traded the whole of §29 for a green tick.
 
 ---
 
@@ -2011,7 +2172,8 @@ failing every call, the hourly rollup just processed ten times its normal volume
 the worker's memory is above its range with an orphaned process left over from a
 restart, a GPU is over its temperature band, the proxy balance runs out in three
 days, one domain is 21 days from expiry with auto-renew off, the franchise tax
-is due, paid search is bringing a quarter of the traffic, a tenth of the signups
+is due, the npm publish token expires in 13 days while two credentials never
+expire at all — one of them an SMTP password nothing has used since February — paid search is bringing a quarter of the traffic, a tenth of the signups
 and an LTV only 1.9x its CAC, and $196 of card spend belongs to no tracked
 vendor. The LLM account also runs dry this week and does not appear as a risk,
 because it tops itself up. And since the 17:31 deploy, the database is serving
@@ -2171,6 +2333,8 @@ and no customer is waiting on it.
     { "id": "issues.open", "label": "Open public issues", "value": 7, "unit": "count", "kind": "gauge", "group": "Code", "direction": "neutral" },
     { "id": "domains.expiring", "label": "Domains expiring", "value": 1, "unit": "count", "kind": "gauge", "group": "Paperwork", "direction": "down_good", "severity": "warn" },
     { "id": "compliance.due", "label": "Filings due", "value": 1, "unit": "count", "kind": "gauge", "group": "Paperwork", "direction": "down_good", "severity": "warn" },
+    { "id": "credentials.expiring", "label": "Credentials expiring", "value": 1, "unit": "count", "kind": "gauge", "group": "Paperwork", "direction": "down_good", "severity": "warn" },
+    { "id": "credentials.perpetual", "label": "Credentials with no expiry", "value": 2, "unit": "count", "kind": "gauge", "group": "Paperwork", "direction": "down_good" },
 
     { "id": "acme.solve.attempts", "label": "Solves — succeeded", "value": 41022, "unit": "count", "kind": "counter", "window": "1h", "service": "inference", "outcome": "success", "group": "Product", "direction": "up_good" },
     { "id": "acme.solve.attempts", "label": "Solves — failed", "value": 178, "unit": "count", "kind": "counter", "window": "1h", "service": "inference", "outcome": "failure", "group": "Product", "direction": "down_good", "expected": { "min": 0, "max": 400 } },
@@ -2654,6 +2818,55 @@ and no customer is waiting on it.
     { "id": "liability-insurance", "name": "General liability insurance", "kind": "insurance", "status": "ok",
       "authority": "Example Insurance", "goodThrough": "2027-02-01T00:00:00.000Z",
       "daysRemaining": 159, "amountCents": 84000, "autoFiled": true }
+  ],
+
+  "credentials": [
+    { "id": "npm-publish-ci", "name": "npm publish — release CI", "provider": "npm", "kind": "token",
+      "write": true, "status": "expiring", "expiresAt": "2026-09-08T00:00:00.000Z",
+      "daysRemaining": 13, "createdAt": "2026-03-12T00:00:00.000Z",
+      "lastUsedAt": "2026-08-26T17:31:00.000Z", "maxAgeDays": 180, "rotation": "manual",
+      "scopes": ["publish"], "owner": "release-eng",
+      "accountUrl": "https://www.npmjs.com/settings/acme/tokens",
+      "asOf": "2026-08-26T18:03:41.000Z",
+      "note": "Publishes @acme/client. Releases stop; nothing serving stops." },
+    { "id": "github-actions-pat", "name": "GitHub — Actions runner", "provider": "github", "kind": "token",
+      "write": true, "status": "perpetual", "expiresAt": null,
+      "createdAt": "2023-11-02T00:00:00.000Z", "lastUsedAt": "2026-08-26T17:29:00.000Z",
+      "maxAgeDays": 365, "rotation": "manual", "scopes": ["repo", "workflow"],
+      "owner": "release-eng", "asOf": "2026-08-26T18:03:41.000Z",
+      "note": "Classic PAT with no expiry, minted before fine-grained tokens. Pushes tags on release, so it is the widest key here." },
+    { "id": "github-report-read", "name": "GitHub — report assembly", "provider": "github", "kind": "token",
+      "write": false, "status": "ok", "expiresAt": "2027-02-14T00:00:00.000Z",
+      "daysRemaining": 172, "createdAt": "2026-02-14T00:00:00.000Z",
+      "lastUsedAt": "2026-08-26T18:03:52.000Z", "maxAgeDays": 365, "rotation": "manual",
+      "scopes": ["public_repo:read", "actions:read"], "owner": "ops",
+      "asOf": "2026-08-26T18:03:41.000Z",
+      "note": "Reads issues and CI runs for this report. Cannot push." },
+    { "id": "cloud-billing-read", "name": "Cloud — billing read", "provider": "aws", "kind": "apiKey",
+      "write": false, "status": "ok", "expiresAt": "2027-01-10T00:00:00.000Z",
+      "daysRemaining": 137, "createdAt": "2026-01-10T00:00:00.000Z",
+      "lastUsedAt": "2026-08-26T06:00:00.000Z", "maxAgeDays": 365, "rotation": "manual",
+      "scopes": ["billing:read"], "vendor": "cloud", "owner": "ops",
+      "asOf": "2026-08-26T18:03:41.000Z", "note": "Fills the vendors section. Read-only by policy." },
+    { "id": "proxy-gateway-key", "name": "Residential proxy — gateway", "provider": "example-proxy",
+      "kind": "apiKey", "write": false, "status": "ok", "expiresAt": "2026-12-01T00:00:00.000Z",
+      "daysRemaining": 97, "createdAt": "2025-12-01T00:00:00.000Z",
+      "lastUsedAt": "2026-08-26T18:02:10.000Z", "maxAgeDays": 365, "rotation": "manual",
+      "vendor": "proxy", "services": ["proxy-gateway", "ingest"], "owner": "ops",
+      "asOf": "2026-08-26T18:03:41.000Z",
+      "note": "Collection stops the moment this lapses, the same way it stops at a zero balance." },
+    { "id": "report-bearer", "name": "This endpoint — bearer token", "provider": "self", "kind": "token",
+      "write": false, "status": "ok", "expiresAt": "2026-11-24T00:00:00.000Z",
+      "daysRemaining": 90, "createdAt": "2026-08-26T00:00:00.000Z",
+      "lastUsedAt": "2026-08-26T18:04:00.000Z", "maxAgeDays": 90, "rotation": "manual",
+      "owner": "ops", "asOf": "2026-08-26T18:03:41.000Z",
+      "note": "Rotated on 26 Aug; the outgoing token was dropped once the dashboard moved." },
+    { "id": "email-smtp-legacy", "name": "Transactional email — legacy SMTP password",
+      "provider": "example-email", "kind": "password", "write": true, "status": "perpetual",
+      "expiresAt": null, "createdAt": "2024-06-18T00:00:00.000Z",
+      "lastUsedAt": "2026-02-11T09:40:00.000Z", "maxAgeDays": 365, "rotation": "none",
+      "vendor": "email", "owner": "ops", "asOf": "2026-08-26T18:03:41.000Z",
+      "note": "Superseded by the API key in February. Nothing has used it since. Revoke it." }
   ],
 
   "extra": {
