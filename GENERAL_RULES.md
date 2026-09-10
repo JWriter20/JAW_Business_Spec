@@ -59,3 +59,17 @@ off. What the code does is already written down, in the code.
 Every repository has a root `docs/` folder, kept deliberately small. One page
 that is current beats five that are thorough; a document nobody finishes is a
 document nobody reads.
+
+1. **The README reflects the repo as it is now** — not as it was designed, not
+   as it is planned. It is the first thing anyone reads and the first thing to
+   go stale.
+2. **Documentation changes in the same PR as the code it describes.** A doc
+   updated "later" is wrong in the meantime, and wrong documentation is worse
+   than none, because it is believed.
+3. **Every code snippet in the README or `docs/` is functional.** It runs as
+   written, against the current API, with no invented flags, renamed methods, or
+   parameters that no longer exist.
+4. **Every snippet has a test that proves it** (TESTING_SPEC.md §1.4). Keep one
+   source — extract the snippet from the tested code, or generate it from the
+   test. Then an API change fails the build instead of quietly making the docs a
+   lie.

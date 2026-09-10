@@ -1,11 +1,17 @@
-<!-- Copy to the root of a repo as AGENTS.md, then fill in "This repository".
-     Everything above that section is the same in every repo — edit it here,
-     in JAW_Business_Spec, never in a copy. -->
+<!-- Copy to the root of a repo as AGENTS.md, then fill in REPO SPECIFIC.
+     GENERAL RULES is identical in every repo — edit it in JAW_Business_Spec,
+     never in a copy. -->
 
 # AGENTS.md
 
 Instructions for any agent working in this repository. Full specs:
 `https://github.com/JWriter20/JAW_Business_Spec`.
+
+---
+
+# GENERAL RULES
+
+Same in every repo we own. Do not edit this section here.
 
 ## Before you touch anything
 
@@ -38,6 +44,8 @@ file was for.
 - **Experiments live in `src/experiments/`, gitignored.** That is the only place
   unfinished work may exist here.
 - Commits and PR titles are written for a stranger reading them in a year.
+- **IMPORTANT: documentation is never stale here.** The first thing a stranger
+  does is run the first README snippet. If it fails, that is the product.
 
 ## Code
 
@@ -53,6 +61,9 @@ file was for.
   over N in a loop.
 - **Comments say why, in a sentence or two.** Simple code needs none. Anything
   longer is a decision — put it in `TRIBAL_KNOWLEDGE.md`.
+- **Docs ship with the code that changed them.** Update the README and `docs/`
+  in the same PR — never "later". Every snippet must run as written, and every
+  snippet needs a test proving it does.
 
 ## Tests
 
@@ -94,13 +105,11 @@ requirements → one agent.
 
 ---
 
-# This repository
+# REPO SPECIFIC
 
-<!-- Everything below is repo-specific. Keep it short. -->
+<!-- Only what is true of this repo alone: stack, commands, layout, gotchas,
+     and any rule tighter than the general ones above. Keep it short — a rule
+     here may add a constraint, never relax one. Delete this comment when you
+     fill it in. -->
 
-**What it is:**
-**Stack:**
-**Public or private:**
-**Run / build / test:**
-**Layout:** see `FILE_PURPOSES.md`
-**Gotchas:** see `TRIBAL_KNOWLEDGE.md`
+_Nothing yet._

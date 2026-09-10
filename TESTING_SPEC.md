@@ -14,6 +14,10 @@ green check next to it.
 3. **No flakes.** A test that fails intermittently is telling you the code is
    non-deterministic — fix the behavior underneath it. Never retry it, loosen
    the assertion, skip it, or write it off as a flake.
+4. **Documented behavior is tested.** Every code snippet in the README and
+   `docs/` has a test that runs it as written and asserts what it claims. A
+   snippet without one is an untested public API that strangers copy and paste
+   (GENERAL_RULES.md §6).
 
 ## 2. Toolchain
 
@@ -64,7 +68,7 @@ No stage starts until the one before it passes:
 
 | Stage | Gate | Cost |
 |---|---|---|
-| 1 | Lockfile matches the manifest (DEPENDENCIES.md §2); repomix output freshly generated; every file present in `FILE_PURPOSES.md`; lint and typecheck. | seconds |
+| 1 | Lockfile matches the manifest (DEPENDENCIES.md §2); repomix output freshly generated; every file present in `FILE_PURPOSES.md`; every README and `docs/` snippet claimed by a test; lint and typecheck. | seconds |
 | 2 | Unit tests — no network, no database, no filesystem. | seconds |
 | 3 | Integration tests — real database, containers, service boundaries. | minutes |
 | 4 | End-to-end tests. | long |

@@ -83,6 +83,12 @@ Confirm whether a repository is public **before** writing anything into it.
 5. **Everything visible is written for a stranger.** README, naming, commit
    messages, PR titles, issues, releases. No `wip`, no `fix`, no `final v2`.
    Nothing merges that you would not be happy to see quoted.
-6. **Publishing a private repo publishes its entire history**, every branch and
+6. **IMPORTANT — documentation is current, or it does not ship.** This matters
+   most here: the first thing a stranger does with a public repo is run the
+   first snippet in the README, and a stale one fails in front of them. The
+   README describes the repo as it is today, docs change in the same PR as the
+   code, and every snippet has a test proving it runs (GENERAL_RULES.md §6).
+   An out-of-date public README is the most visible defect a business can ship.
+7. **Publishing a private repo publishes its entire history**, every branch and
    every commit — not just `HEAD`. Audit the history before flipping the switch,
    and rotate anything it ever contained (§1.4).
