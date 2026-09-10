@@ -68,7 +68,7 @@ No stage starts until the one before it passes:
 
 | Stage | Gate | Cost |
 |---|---|---|
-| 1 | Lockfile matches the manifest (DEPENDENCIES.md §2); repomix output freshly generated; every file present in `FILE_PURPOSES.md`; every README and `docs/` snippet claimed by a test; lint and typecheck. | seconds |
+| 1 | Lockfile matches the manifest (DEPENDENCIES.md §2); repomix output freshly generated; `FILE_PURPOSES.md` matches `git ls-files` exactly, in both directions; every README and `docs/` snippet claimed by a test; lint and typecheck. | seconds |
 | 2 | Unit tests — no network, no database, no filesystem. | seconds |
 | 3 | Integration tests — real database, containers, service boundaries. | minutes |
 | 4 | End-to-end tests. | long |
@@ -79,9 +79,15 @@ to fix — a stale repomix or a missing `FILE_PURPOSES.md` entry is one command,
 and there is no reason to spend a full test run discovering it. Order within a
 stage follows the same rule: fastest first.
 
+The `FILE_PURPOSES.md` gate enumerates `git ls-files`, never the directory tree,
+and fails on an entry with no file just as it fails on a file with no entry. A
+map that describes `dist/` and `node_modules/` is not a stricter map — it is
+thousands of lines that go stale on the next build and bury the ones that matter
+(AGENTS_SPEC.md §4).
+
 ## 6. CI gates
 
 CI runs the full suite on every PR — that is what the full suite is for. The
 build fails on any gate in §5, and merging is blocked until it is green. The
-stage-1 gates keep the codebase navigable (AGENTS_SPEC.md §2); a stale map is
+stage-1 gates keep the codebase navigable (AGENTS_SPEC.md §4); a stale map is
 worse than no map, because it still gets trusted.

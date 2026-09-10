@@ -1,4 +1,7 @@
-<!-- Copy to the root of a repo as AGENTS.md, then fill in REPO SPECIFIC.
+<!-- Copy to the root of an INTERNAL repo as AGENTS.md, then fill in REPO
+     SPECIFIC. In a DISTRIBUTED repo — a public dev tool other people install —
+     this GENERAL RULES block goes in CONTRIBUTING.md instead, and AGENTS.md is
+     written for whoever is using the product (AGENTS_SPEC.md §1, §3).
      GENERAL RULES is identical in every repo — edit it in JAW_Business_Spec,
      never in a copy. -->
 
@@ -28,7 +31,10 @@ comparable exists; if something close exists, extend it rather than fork it.
 Duplicated logic is a serious defect. `npm run repomix` rebuilds the map (~2s)
 if it is stale.
 
-Update `FILE_PURPOSES.md` when you add a file — CI fails without the entry.
+Update `FILE_PURPOSES.md` when you add or delete a tracked file — CI fails on a
+missing entry and on a stale one. It covers `git ls-files` and nothing else:
+never add an entry for build output, `node_modules/`, a virtualenv, a log, or
+anything else gitignored.
 
 ## Professionalism (public repos)
 
