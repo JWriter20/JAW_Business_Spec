@@ -313,6 +313,7 @@ support response time.
   "service": "api",            // scope: §6.1
   "instance": null,            // dimension within a scope: a mount, a GPU, a queue
   "outcome": null,             // success | failure — split a metric by result
+  "charge": null,              // recurring | usage | one_time — money only (§6.2)
   "group": "Usage",            // free text; the UI groups tiles by it
   "direction": "down_good",    // up_good | down_good | neutral  (default neutral)
   "severity": "ok",            // ok | warn | crit
@@ -356,6 +357,7 @@ A metric may name what it is about. All are optional; more than one may be set.
 | `stage` | `funnel[].id` | people who finished onboarding |
 | `instance` | free text, within the scope above | `/data`, `gpu0`, `queue:apply` |
 | `outcome` | `success` \| `failure` | attempts that succeeded vs failed |
+| `charge` | `recurring` \| `usage` \| `one_time` | how money moved: a subscription, a metered bill, a single purchase. Money ids only (§6.2) |
 
 Unscoped means business-wide. `revenue.net` with no scope is the company's;
 `revenue.net` with `service: "api"` is that product line's.
@@ -396,6 +398,8 @@ error.
 |---|---|---|---|
 | `revenue.mrr` | gauge | up_good | Recurring, normalized to a month. |
 | `revenue.gross` | counter | up_good | Collected in the window, before fees. |
+| `revenue.recurring` | counter | up_good | The part of `revenue.gross` collected from subscriptions and renewals. |
+| `revenue.one_time` | counter | up_good | The part of `revenue.gross` collected from single purchases — lifetime plans, credit packs, one-off fees. |
 | `revenue.net` | counter | up_good | After processor fees and refunds. |
 | `revenue.arpu` | gauge | up_good | Net revenue ÷ paying users, per month. |
 | `revenue.pending_payout` | gauge | neutral | Owed out, not yet paid. |
@@ -403,6 +407,18 @@ error.
 | `payments.failed` (`count`) | counter | down_good | Declined or errored charges. |
 | `payments.refunds` | counter | down_good | Refunded in the window. |
 | `payments.disputed` | counter | down_good | Chargebacks opened in the window. |
+
+**Recurring and one-time are the two halves of gross.** For the same window and
+scope, `revenue.recurring` + `revenue.one_time` = `revenue.gross`, and a producer
+that emits one of them emits both — a lone `revenue.one_time` reads as "all other
+income was recurring" to a consumer that subtracts. `revenue.mrr` is not the
+recurring half: it is a normalised monthly *rate* (an annual plan counts a
+twelfth), where `revenue.recurring` is cash that actually arrived in the window
+(that annual plan counts in full, the month it was paid). A business with no
+subscriptions reports `revenue.recurring` as `0`, not null — it knows it has none.
+
+Earnings by category are `service`-scoped rows of the same ids: `revenue.gross`
+with `service: "api"` is that product line's. Categories sum to the unscoped row.
 
 **Users** — all `count`.
 
@@ -548,6 +564,9 @@ cardinality is unbounded, and this document has a 1000-metric cap.
 | id | unit | kind | direction | meaning |
 |---|---|---|---|---|
 | `cost.total` | `usd_cents` | counter | down_good | All spend in the window. |
+| `cost.recurring` | `usd_cents` | counter | down_good | The part of `cost.total` that is a subscription or plan price, charged whether or not it is used. |
+| `cost.usage` | `usd_cents` | counter | down_good | The part of `cost.total` that is metered — it moves with load. |
+| `cost.one_time` | `usd_cents` | counter | down_good | The part of `cost.total` that is a single purchase: a domain, hardware, a filing fee. |
 | `cost.spend` | `usd_cents` | counter | down_good | Spend attributable to one label. Scope with `service`, `host`, `job`, or `vendor`, and give it a display `label`. |
 | `cost.per_unit` | `usd_cents` | gauge | down_good | `cost.total` ÷ `usage.units`. |
 | `cost.per_user` | `usd_cents` | gauge | down_good | `cost.total` ÷ active users. |
@@ -563,6 +582,17 @@ cardinality is unbounded, and this document has a 1000-metric cap.
 be several axes — by our service, by host, by job, by vendor. **Sum within one
 label, never across.** The same dollar appears once per axis, so adding a
 by-service row to a by-host row counts it twice.
+
+**Every vendor-scoped `cost.spend` row carries `charge`.** It is what lets a consumer answer
+"what would stop if we cancelled" (recurring), "what grows with traffic" (usage),
+and "what was a one-off this month" (one_time) without knowing any vendor. One
+vendor may need two rows — a plan price as `recurring` and overage as `usage`.
+Within one window, `cost.recurring` + `cost.usage` + `cost.one_time` =
+`cost.total`, and the vendor rows of one `charge` sum to no more than the matching
+total — the gap is spend no vendor row attributes. Rows on the other axes
+(`service`, `host`, `job`, `source`) mix kinds and may omit `charge`.
+Spend by category is a consumer group-by on the row's vendor's `category`
+(§10); a row with no vendor is `other`.
 
 The vendor axis is usually free, since bills arrive itemised. Attributing spend
 to your *own* services needs resource tagging you may not have — an estimate
@@ -973,10 +1003,18 @@ Ranking accounts by "days until zero" only means something if the ones that
 never reset, and the ones that refill themselves, are distinguishable from the
 ones that do neither.
 
-**Recurring and metered spend only.** One-time charges — a domain purchase, a
-GPU, an annual filing fee — stay out by default; this section is for monitoring
-what is running, not for bookkeeping. A producer that wants them anyway puts
-them in `spend.lastInvoiceCents` for the period they hit and says so in `note`.
+**One-time charges are money out, and are reported — but not as burn.** A domain
+purchase, a GPU, an annual filing fee: report it as a `cost.spend` row with
+`charge: "one_time"`, scoped to its vendor, in the window it was paid, and count
+it in `cost.one_time` and `cost.total`. Keep it OUT of the vendor's
+`spend.periodToDateCents` and `projectedPeriodCents`: those describe what is
+running, and a $1,200 GPU folded into this month's run rate projects a $14,000
+year that nobody is spending. A charge only a human knows about comes from a
+facts file with its date and amount; a guessed one-off is worse than none.
+
+A vendor's own spend is `recurring` when `plan` carries a price and a `monthly`
+or `yearly` interval, and `usage` when it is metered (`interval: "none"`); the `cost.spend` rows for that vendor
+say so in `charge`.
 
 **`parent` breaks a bill into line items, and you should break it.** One
 provider with compute, functions, storage, a database, and egress is six
@@ -2221,6 +2259,8 @@ and no customer is waiting on it.
   "metrics": [
     { "id": "revenue.mrr", "label": "MRR", "value": 4289000, "unit": "usd_cents", "kind": "gauge", "group": "Revenue", "direction": "up_good", "target": 5000000, "featured": true },
     { "id": "revenue.gross", "label": "Gross revenue", "value": 5120400, "unit": "usd_cents", "kind": "counter", "window": "30d", "group": "Revenue", "direction": "up_good" },
+    { "id": "revenue.recurring", "label": "Recurring revenue", "value": 4935400, "unit": "usd_cents", "kind": "counter", "window": "30d", "group": "Revenue", "direction": "up_good" },
+    { "id": "revenue.one_time", "label": "One-time revenue", "value": 185000, "unit": "usd_cents", "kind": "counter", "window": "30d", "group": "Revenue", "direction": "up_good", "note": "Credit packs." },
     { "id": "revenue.net", "label": "Net revenue", "value": 4712100, "unit": "usd_cents", "kind": "counter", "window": "30d", "group": "Revenue", "direction": "up_good" },
     { "id": "revenue.net", "label": "Net revenue — API", "value": 3980200, "unit": "usd_cents", "kind": "counter", "window": "30d", "service": "api", "group": "Revenue", "direction": "up_good" },
     { "id": "revenue.net", "label": "Net revenue — inference", "value": 731900, "unit": "usd_cents", "kind": "counter", "window": "30d", "service": "inference", "group": "Revenue", "direction": "up_good" },
@@ -2317,6 +2357,12 @@ and no customer is waiting on it.
     { "id": "resource.gpu_power_w", "label": "GPU 0 power", "value": 420, "unit": "other", "unitLabel": "W", "kind": "gauge", "host": "gpu-01", "instance": "gpu0", "group": "Machines", "direction": "neutral" },
 
     { "id": "cost.total", "label": "Spend", "value": 191400, "unit": "usd_cents", "kind": "counter", "window": "30d", "group": "Cost", "direction": "down_good", "expected": { "min": 150000, "max": 210000 }, "featured": true },
+    { "id": "cost.recurring", "label": "Spend — recurring", "value": 21800, "unit": "usd_cents", "kind": "counter", "window": "30d", "group": "Cost", "direction": "down_good" },
+    { "id": "cost.usage", "label": "Spend — usage", "value": 157600, "unit": "usd_cents", "kind": "counter", "window": "30d", "group": "Cost", "direction": "down_good" },
+    { "id": "cost.one_time", "label": "Spend — one-time", "value": 12000, "unit": "usd_cents", "kind": "counter", "window": "30d", "group": "Cost", "direction": "down_good" },
+    { "id": "cost.spend", "label": "Spend — datacentre bandwidth", "value": 1800, "unit": "usd_cents", "kind": "counter", "window": "30d", "vendor": "bandwidth", "charge": "recurring", "group": "Cost", "direction": "down_good" },
+    { "id": "cost.spend", "label": "Spend — cloud provider", "value": 98200, "unit": "usd_cents", "kind": "counter", "window": "30d", "vendor": "cloud", "charge": "usage", "group": "Cost", "direction": "down_good" },
+    { "id": "cost.spend", "label": "Spend — cloud GPU reservation fee", "value": 12000, "unit": "usd_cents", "kind": "counter", "window": "30d", "vendor": "cloud", "charge": "one_time", "group": "Cost", "direction": "down_good", "note": "Paid once on 2026-08-12; not in the account's run rate." },
     { "id": "cost.per_unit", "label": "Cost per credit", "value": 15, "unit": "usd_cents", "kind": "gauge", "window": "30d", "group": "Cost", "direction": "down_good" },
     { "id": "cost.per_user", "label": "Cost per active user", "value": 31, "unit": "usd_cents", "kind": "gauge", "window": "30d", "group": "Cost", "direction": "down_good" },
     { "id": "margin.gross", "label": "Gross margin", "value": 0.9594, "unit": "ratio", "kind": "gauge", "window": "30d", "group": "Cost", "direction": "up_good", "signed": true },
