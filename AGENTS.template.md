@@ -109,6 +109,18 @@ One PR, independent slow parts → subagents in worktrees, merge each into your
 branch as it finishes, then delete the worktrees. Shared files or ordering
 requirements → one agent.
 
+Worktrees live **only** at `~/worktrees/<repo path relative to ~>/<task>`, e.g.
+`~/jobharvest/FlashCollection` → `~/worktrees/jobharvest/FlashCollection/<task>`:
+
+```bash
+git -C ~/<repo> worktree add ~/worktrees/<repo>/<task> -b feat/<task> origin/dev
+```
+
+Never beside the repo (`../<repo>-wt-*`), inside it (`.claude/worktrees/`), in
+`/tmp`, or as a second clone. Remove your worktree (`git worktree remove`, then
+`git worktree prune`) once its PR merges or closes; never remove one holding
+uncommitted work.
+
 ---
 
 # REPO SPECIFIC
