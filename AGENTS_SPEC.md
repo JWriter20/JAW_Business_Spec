@@ -218,6 +218,40 @@ it rather than fork it — duplicating logic is a serious defect, not a shortcut
 
 Every worktree follows the same branch discipline: off `dev`, in by PR.
 
+### 6.1 Where worktrees live
+
+Every worktree lives under `~/worktrees/`, at the repo's own path relative to
+`~`, in a folder named for the task:
+
+| Repo | Its worktrees |
+|---|---|
+| `~/jobharvest/FlashCollection` | `~/worktrees/jobharvest/FlashCollection/<task>` |
+| `~/captchakraken/captchakraken-cloud` | `~/worktrees/captchakraken/captchakraken-cloud/<task>` |
+
+```bash
+git -C ~/jobharvest/FlashCollection fetch origin
+git -C ~/jobharvest/FlashCollection worktree add \
+  ~/worktrees/jobharvest/FlashCollection/<task> -b feat/<task> origin/dev
+```
+
+1. **Nowhere else.** Not beside the repo (`../<repo>-wt-<task>`), not inside
+   it (`.claude/worktrees/`, `.agent-worktrees/`), not in `/tmp`, a scratchpad,
+   or another disk. A worktree found outside `~/worktrees/` is a defect and is
+   moved (`git worktree move`) or removed.
+2. **`<task>` is the task id or branch slug.** No repo name, no `-wt-`: the
+   path already says which repo it belongs to.
+3. **A worktree is not a clone.** Parallel work adds a worktree to the one
+   canonical checkout; it never makes a second clone of the repo.
+4. **Whoever creates a worktree removes it** as soon as it is no longer needed,
+   and at the latest when its PR merges or closes:
+   `git -C <repo> worktree remove <path>`, then `git -C <repo> worktree prune`.
+   The branch survives removal, so a worktree is cheap to recreate and none is
+   kept "just in case". A worktree holding uncommitted work is never removed:
+   commit and push it, or hand it back to the user.
+5. **Tools follow the same rule.** Anything that creates worktrees on an
+   agent's behalf (a harness's built-in worktree isolation, a pipeline, a
+   script) is configured to create them at this path, or is not used.
+
 ## 7. Running tests
 
 1. **Run the failing test, not the suite.** The full suite runs in CI on every
