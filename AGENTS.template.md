@@ -67,6 +67,11 @@ file was for.
   over N in a loop.
 - **Comments say why, in a sentence or two.** Simple code needs none. Anything
   longer is a decision — put it in `TRIBAL_KNOWLEDGE.md`.
+- **Every trigger is on the flow map.** Adding, removing, or rewiring a cron, a
+  scheduled workflow, a webhook, a dispatch, a poller, or a queue consumer
+  updates the business's `flows` (MONITORING_SPEC.md §32) in the same PR, and
+  whatever one step starts passes the `trace` along so its run joins the chain
+  (§33).
 - **Docs ship with the code that changed them.** Update the README and `docs/`
   in the same PR — never "later". Every snippet must run as written, and every
   snippet needs a test proving it does.
