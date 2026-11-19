@@ -13,7 +13,7 @@ needs a reason to break, and a repo that breaks one records why in its
 | [TESTING_SPEC.md](TESTING_SPEC.md) | What a test must prove, the toolchain, coverage, CI gates. |
 | [DEPENDENCIES.md](DEPENDENCIES.md) | Package managers, pinning, the monthly upgrade. |
 | [VERSION_CONTROL.md](VERSION_CONTROL.md) | Branches, environments, deployments, rollback. |
-| [MONITORING_SPEC.md](MONITORING_SPEC.md) | `jaw-business-report/1` — the one reporting endpoint every business serves. |
+| [MONITORING_SPEC.md](MONITORING_SPEC.md) | `jaw-business-report/1` — the one reporting endpoint every business serves, including the map of what triggers what (§32) and the run of every step (§33). |
 | [AGENTS_SPEC.md](AGENTS_SPEC.md) | How coding agents operate in these repos. |
 | [AGENTS.template.md](AGENTS.template.md) | The `AGENTS.md` an internal repo copies to its root. |
 

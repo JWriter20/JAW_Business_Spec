@@ -19,7 +19,8 @@ Four rules the rest of this document follows from:
 The goal is a document rich enough that a dashboard — or a local model reading
 it every minute — can tell something is wrong: spend climbing, a cron that
 processed 212,000 rows instead of 20,000, memory creeping in one service, a
-domain expiring, a filing overdue, a GPU throttling, support mail piling up.
+domain expiring, a filing overdue, a GPU throttling, support mail piling up, a
+release that cleared its build and never reached the fleet.
 
 **Status:** v1. **License:** Apache-2.0.
 
@@ -81,8 +82,8 @@ Sections are one of two kinds, and the kind decides how `since` applies.
 
 | Kind | Sections | `since` |
 |---|---|---|
-| **Snapshot** | `metrics`, `services`, `vendors`, `accounts`, `hosts`, `endpoints`, `sources`, `funnel`, `apis`, `actions`, `jobs`, `deployments`, `domains`, `compliance`, `incidents` | Ignored. Always current and complete. |
-| **Stream** | `events`, `errors`, `inbox`, `issues`, `ci` | Return only items after the watermark. |
+| **Snapshot** | `metrics`, `services`, `vendors`, `accounts`, `hosts`, `endpoints`, `sources`, `funnel`, `apis`, `actions`, `jobs`, `deployments`, `flows`, `domains`, `compliance`, `incidents` | Ignored. Always current and complete. |
+| **Stream** | `events`, `errors`, `inbox`, `issues`, `ci`, `runs` | Return only items after the watermark. |
 
 Each stream is ordered by one timestamp field. That field is what "after the
 cursor" means, and what a checker compares against:
@@ -94,6 +95,7 @@ cursor" means, and what a checker compares against:
 | `inbox` | `receivedAt` |
 | `issues` | `updatedAt` — an issue returns when it is commented on, not only when opened |
 | `ci` | `startedAt` |
+| `runs` | `updatedAt` — a run returns when it finishes, not only when it starts |
 
 ### The response reports what it covered
 
@@ -106,7 +108,8 @@ cursor" means, and what a checker compares against:
     "errors": "2026-08-26T18:03:59.417Z",
     "inbox":  "2026-08-26T18:03:57.001Z",
     "issues": "2026-08-26T18:03:52.660Z",
-    "ci":     "2026-08-26T18:03:59.980Z"
+    "ci":     "2026-08-26T18:03:59.980Z",
+    "runs":   "2026-08-26T18:03:59.204Z"
   },
   "complete": true
 }
@@ -135,9 +138,10 @@ document that something else renders (§29, rule 11). Parse it, or return null.
    costs a permanent gap. Choose duplicates.
 3. **Delivery is at-least-once, and `id` means one of two things.**
    - `events`, `inbox`, `ci` — one `id` per item. A repeat is a duplicate; drop it.
-   - `errors`, `issues` — `id` names a bucket or an issue, and it comes back every
-     time that thing changes. Upsert on `id`. What separates a duplicate from an
-     update is `(id, lastSeenAt)` and `(id, updatedAt)`.
+   - `errors`, `issues`, `runs` — `id` names a bucket, an issue, or a run, and it
+     comes back every time that thing changes. Upsert on `id`. What separates a
+     duplicate from an update is `(id, lastSeenAt)` for errors and
+     `(id, updatedAt)` for the other two.
 
    Never add an error bucket's `count` to what you already stored for the same
    `lastSeenAt`. Rule 2 makes duplicates deliberate, and summing them inflates the
@@ -195,12 +199,14 @@ For anything held in memory, such as error counters in a long-lived process:
   "actions":     [ … ],   // work we do, and how long it takes     §15
   "jobs":        [ … ],   // crons and batches, with normal ranges  §16
   "deployments": [ … ],   // what is running                       §17
+  "flows":       [ … ],   // what triggers what, and where it is now §32
 
   "events":    [ … ],     // stream: notable things that happened  §18
   "errors":    [ … ],     // stream: bucketed application errors   §19
   "inbox":     [ … ],     // stream: new customer mail             §20
   "issues":    [ … ],     // stream: public repo issues            §21
   "ci":        [ … ],     // stream: failed CI and test runs       §22
+  "runs":      [ … ],     // stream: each time a flow step ran     §33
 
   "incidents":  [ … ],    // open and recently resolved            §23
   "domains":    [ … ],    // registrations and expiry              §24
@@ -805,8 +811,10 @@ its `id` (§6.1).
 }
 ```
 
-`dependsOn` draws the flow graph, so one root failure renders as one red node
-with greyed dependents instead of nine red alerts. `critical: false` is for what
+`dependsOn` draws the dependency graph, so one root failure renders as one red
+node with greyed dependents instead of nine red alerts. It is who calls whom at
+request time; what *causes* what over time — crons, builds, releases, pollers —
+is `flows` (§32). `critical: false` is for what
 is allowed to be down at 3am. `startedAt` is what lets a consumer tell a memory
 leak from a restart sawtooth.
 
@@ -1865,11 +1873,13 @@ dropped buffer (§2) is declared here too.
 | `funnel` | 20 | Truncated from the bottom of the funnel up. |
 | `jobs` | 100 | Truncated, not-`ok` first. |
 | `deployments` | 100 | Truncated. |
+| `flows` | 50 flows, 100 nodes and 200 edges each | Truncated, not-`ok` flows first. Never drop a node an edge still names; drop the edge with it. |
 | `events` | 500 | §2, rule 4. |
 | `errors` | 100 buckets | By `count` descending, and the tail is lost (§2, rule 4). |
 | `inbox` | 100 | §2, rule 4. |
 | `issues` | 100 | §2, rule 4. |
 | `ci` | 100 | §2, rule 4. |
+| `runs` | 500 | §2, rule 4. |
 | `incidents` | 100 | Truncated, `crit` first. |
 | `domains` | 200 | Truncated, soonest expiry first. |
 | `compliance` | 100 | Truncated, soonest due first. |
@@ -2068,7 +2078,9 @@ on every account not denominated in `usd`, and every `url`, `accountUrl`, and
 `links[].url` an `http` or `https` URL and nothing else (§29, rule 11),
 `provider`, `kind`, `write`, and `status` set on every credential with no
 `unknown` for `write`, `expiresAt` present whenever a credential's status is
-`ok`, `expiring`, or `expired`, and null when it is `perpetual` (§26).
+`ok`, `expiring`, or `expired`, and null when it is `perpetual` (§26),
+`audience` and `status` on every flow and `kind` and `status` on every node and
+`via` on every edge (§32), flow and node ids drawn from `[a-z0-9._-]`.
 *Errors.*
 
 **And no credential material anywhere in the document.** Reject any
@@ -2119,6 +2131,18 @@ somebody will paste a key into at 3 a.m., and the check costs a regex.
 - No credential whose `expiresAt` has already passed reports `ok` or `expiring`,
   and no `perpetual` credential carries an `expiresAt` (§26).
 - Every `expected` has `min <= max`.
+- Every edge's `from` and `to`, and every node's `follows`, resolves to a node in
+  this document — except a `business:flow/node` reference, which names another
+  business and is left to the consumer (§32). Every node's `service`, `job`,
+  `action`, `host`, and `api` resolves. Every `runs[].flow` and `runs[].node`
+  resolves, and every non-null `runs[].cause` names a run the business has
+  reported or is reporting now.
+- No node reports `ok` while its `lastSuccessAt` is older than its
+  `staleAfterSeconds`, and none reports `ok` while its `current.value` differs
+  from the node it `follows` for longer than `driftAfterSeconds`. That is
+  `stalled`, and calling it `ok` is the failure §32 exists to catch.
+- A flow is `ok` only while none of its nodes, other than `external`, `disabled`,
+  `waiting`, and `idle` ones, reports anything worse.
 - An action's duration percentiles are ordered — p50 ≤ p95 ≤ p99 ≤
   `action.duration_max` — within one scope, window, and outcome.
 - No subaction reports a duration above its parent's at the same percentile,
@@ -2154,7 +2178,12 @@ covered by their parent's count (§15); `resource.processes` and
 every credential, and `maxAgeDays` on every `perpetual` one, since nothing else
 in the document will ever raise it (§26); `featured` metrics present, at
 most eight; `generatedAt` recent; every service either has a host, inherits one,
-declares `serverless`, or is `kind: thirdParty`; every `audience: internal`
+declares `serverless`, or is `kind: thirdParty`; at least one flow whenever the
+business has a cron, a scheduled CI workflow, a webhook receiver, or a queue
+consumer, since §32 says every one of them is on the map; `repo` on every node
+that is not `external` or `manual`; `staleAfterSeconds` on every `trigger` that
+holds a `schedule`, and `maxLagSeconds` on every `poll` edge, since without them
+a stopped chain never turns any colour; `trace` on every run whose `cause` is set; every `audience: internal`
 service says in `name`, `note`, or `message` what it is for, since nothing else
 in the document explains why a red row is not being acted on.
 *Warnings* — a business with no revenue is not a malformed business.
@@ -2178,8 +2207,9 @@ in the document explains why a red row is not being acted on.
   rotated without an outage, so it will not be rotated (§29, rule 4).
 - **Cursor round trip:** call once, send `cursor.streams` back immediately, and
   confirm the watermarks come back equal or later and no `events`, `inbox`, or
-  `ci` item repeats. `errors` and `issues` may legitimately return the same id
-  again, so compare `(id, lastSeenAt)` and `(id, updatedAt)` there (rule 3). It
+  `ci` item repeats. `errors`, `issues`, and `runs` may legitimately return the
+  same id again, so compare `(id, lastSeenAt)` and `(id, updatedAt)` there
+  (rule 3). It
   catches the race in §2: a producer stamping watermarks from a single "now"
   fails it.
 
@@ -2195,6 +2225,281 @@ not quietly blank a chart. **Pass 4 cannot run in CI**, because a hosted runner'
 egress address is not on the allowlist and never should be. Run it from the
 consumer's own machine on a schedule. A red build "fixed" by widening the
 allowlist has traded the whole of §29 for a green tick.
+
+## 32. `flows` — what triggers what
+
+The map of how the business's parts connect over time: every process, every step
+in it, what starts each step, and what each step starts. One entry per flow, each
+a small directed graph whose nodes carry their current state. A consumer draws it
+as a node graph — a cron on the left, the fleet that serves its output on the
+right, every arrow labelled with how the handoff happens — and colours each node
+by what it last did.
+
+`services[].dependsOn` (§9) answers *who calls whom while a request is in
+flight*. `flows` answers the question that section cannot: *what causes what*. A
+new upstream release is noticed by a poller, which dispatches a build, which
+publishes an artifact, which a fleet picks up on its next poll, which customers
+then receive. None of those steps calls the next one while a customer waits, so
+none of them is a `dependsOn` edge, and every one of them is a place the chain
+can stop without anything going red. A business that cannot draw this graph
+cannot say where a stuck release is stuck.
+
+**Every trigger the business owns appears in some flow.** A cron, a scheduled CI
+workflow, a webhook receiver, a `repository_dispatch` or `workflow_call`, a
+poller, a queue consumer, a file or bucket watcher, a deploy hook, and the
+manual script someone runs by hand each month. If it starts work, it is a node,
+and what it starts is an edge. A step that exists in code and not on the map is
+the step nobody looks at during an outage.
+
+```jsonc
+{
+  "id": "firefox-release",                     // REQUIRED. stable. [a-z0-9._-]
+  "name": "New Firefox release → shipped build",// REQUIRED
+  "audience": "external",                      // REQUIRED. external | internal — §9.1
+  "critical": false,                           // §9.1
+  "status": "failed",                          // REQUIRED. roll-up, see below
+  "summary": "147.0.1 build failed the render lease check 3h ago; fleet still on 146.0.2.",
+  "repos": ["acme/autoupdate", "acme/renderpack", "acme/renderfarm"],
+  "nodes": [
+    { "id": "detect", "name": "Poll for a new Firefox release", "kind": "trigger",
+      "repo": "acme/autoupdate", "path": ".github/workflows/check.yml",
+      "schedule": "0 */6 * * *", "status": "ok",
+      "current": { "label": "Latest upstream", "value": "147.0.1",
+                   "at": "2026-08-26T12:00:41.000Z" },
+      "lastRun": { "id": "gh-8821", "startedAt": "2026-08-26T12:00:03.000Z",
+                   "finishedAt": "2026-08-26T12:00:41.000Z", "outcome": "success",
+                   "trace": "ff-147.0.1",
+                   "url": "https://github.com/acme/autoupdate/actions/runs/8821" },
+      "lastSuccessAt": "2026-08-26T12:00:41.000Z",
+      "staleAfterSeconds": 43200 },
+
+    { "id": "build", "name": "Rebase patches and build", "kind": "step",
+      "repo": "acme/autoupdate", "path": ".github/workflows/build.yml",
+      "host": "build-01", "status": "ok",
+      "lastRun": { "id": "gh-8822", "startedAt": "2026-08-26T12:01:10.000Z",
+                   "finishedAt": "2026-08-26T13:40:02.000Z", "outcome": "success",
+                   "trace": "ff-147.0.1" } },
+
+    { "id": "lease-check", "name": "Render lease check", "kind": "gate",
+      "repo": "acme/autoupdate", "status": "failed", "consecutiveFailures": 2,
+      "lastRun": { "id": "gh-8830", "startedAt": "2026-08-26T13:41:00.000Z",
+                   "finishedAt": "2026-08-26T14:02:13.000Z", "outcome": "failure",
+                   "trace": "ff-147.0.1",
+                   "message": "Canvas hash differs from reference on 3 of 40 sites",
+                   "url": "https://github.com/acme/autoupdate/actions/runs/8830" } },
+
+    { "id": "release", "name": "Publish build", "kind": "artifact",
+      "repo": "acme/autoupdate", "status": "waiting",
+      "current": { "label": "Published", "value": "146.0.2",
+                   "at": "2026-08-12T09:14:00.000Z" } },
+
+    { "id": "fleet", "name": "Render fleet serving", "kind": "service",
+      "service": "renderfarm", "repo": "acme/renderfarm", "status": "ok",
+      "current": { "label": "Serving", "value": "146.0.2",
+                   "at": "2026-08-12T09:31:00.000Z" },
+      "follows": "release", "driftAfterSeconds": 3600 },
+
+    { "id": "clients", "name": "Customer installs", "kind": "external",
+      "status": "unknown" }
+  ],
+  "edges": [
+    { "from": "detect",      "to": "build",       "via": "dispatch", "on": "change",
+      "label": "repository_dispatch firefox-release", "maxLagSeconds": 600 },
+    { "from": "build",       "to": "lease-check", "via": "workflow", "on": "success" },
+    { "from": "lease-check", "to": "release",     "via": "workflow", "on": "success" },
+    { "from": "release",     "to": "fleet",       "via": "poll",
+      "label": "coordinator reads versions.json every 5 min", "maxLagSeconds": 900 },
+    { "from": "fleet",       "to": "clients",     "via": "http" },
+    { "from": "billing/charge", "to": "fleet",    "via": "queue", "label": "lease credit" }
+  ],
+  "note": null
+}
+```
+
+### Nodes
+
+| `kind` | Is | Example |
+|---|---|---|
+| `trigger` | Where a chain starts on its own. | A cron, a scheduled workflow, a webhook receiver, an upstream poller. |
+| `step` | Work that runs and finishes. | A build, a migration, a batch, a deploy. |
+| `gate` | A step whose job is to say yes or no. Failure stops the chain on purpose. | Tests, a parity check, an approval. |
+| `artifact` | Something produced and kept, with a version. | A release, an image, a model file, a manifest in a bucket. |
+| `service` | Something long-running that picks up what the chain produced. | A fleet, an API, a worker pool. Set `service` to its `services[].id`. |
+| `manual` | A person. | "Jake approves the release", the monthly script run by hand. |
+| `external` | Somebody else's system, at either end. | The upstream that publishes, the customer install that downloads. |
+
+**`status`** is one enum for nodes and flows:
+
+| | Means |
+|---|---|
+| `ok` | Last run succeeded, or the service is up, and nothing is overdue. |
+| `running` | A run is in progress now. |
+| `waiting` | Ready to run and blocked on something upstream — usually a failed `gate`. Not itself broken. |
+| `stalled` | Should have run, or should have picked something up, and has not: past `staleAfterSeconds`, past an incoming edge's `maxLagSeconds`, or past `driftAfterSeconds` behind what it `follows`. |
+| `failed` | Last run failed, or the service is `down`. |
+| `idle` | Nothing to do, and nothing expected. A trigger that found no new release. |
+| `disabled` | Turned off on purpose. Say why in `message`. |
+| `unknown` | The business cannot observe this node. |
+
+**`stalled` is the status this section exists for.** A step that throws turns
+red on its own; a step that is never invoked does not. A poller whose cron
+stopped, a dispatch that a renamed workflow no longer receives, a fleet that
+stopped reading the manifest — each looks green forever unless something
+declares how long silence is allowed to last. Declare it on every node that has
+a normal rhythm: `staleAfterSeconds` on a node that should succeed at least that
+often, `maxLagSeconds` on an edge whose target should start within that long of
+its source succeeding.
+
+**The flow's `status` is the business's roll-up**, as with a parent service
+(§9.2): normally the worst status of any node that is not `external` or
+`disabled`, with `waiting` and `idle` never outranking `ok`. `summary` says in
+one sentence where the chain is and what is wrong. It is what an on-call reader
+sees before they look at the graph.
+
+**`current`** is what a node holds or serves right now — the version an artifact
+was last published at, the build a fleet is running, the release an upstream
+poller last saw. It is the field that answers *has it reached production yet*.
+`follows` names the node whose `current.value` this one should eventually equal,
+and `driftAfterSeconds` how long the two may legitimately differ. A fleet serving
+146 while the published build is 147 is a fact; whether it is a fault depends on
+how long ago 147 shipped, and only the business knows the window.
+
+**`lastRun`** is the most recent run of the node, in the shape of
+`jobs[].lastRun` (§16) plus `id`, `trace`, and `message`. `outcome` adds
+`skipped` and `cancelled` to the §16 values. `lastSuccessAt` is kept separately
+because the most recent run is rarely the last good one during an outage, and
+"last good four days ago" is the number that sizes the problem.
+
+Point the rest of the document at the node rather than repeating it: `service`,
+`job`, `action`, `host`, and `api` resolve to the sections they name, and a node
+that is also a job reports the same `lastRun` in both places. `repo` is
+`owner/name` and `path` is the file in it that defines the trigger or the step,
+so a red node is one click from the code that runs it.
+
+### Edges
+
+```jsonc
+{
+  "from": "release",          // REQUIRED. a node reference, below
+  "to": "fleet",              // REQUIRED
+  "via": "poll",              // REQUIRED. how the handoff happens
+  "on": "success",            // success | failure | always | change. default success
+  "label": "coordinator reads versions.json every 5 min",
+  "maxLagSeconds": 900        // target should start within this long of the source finishing
+}
+```
+
+| `via` | The target starts because |
+|---|---|
+| `cron` | A schedule fired. Edge from a `trigger` that holds the `schedule`. |
+| `workflow` | The next job or step in the same pipeline run. |
+| `dispatch` | An explicit cross-pipeline call — `repository_dispatch`, `workflow_call`, `workflow_run`, an API that starts a job. |
+| `push` | A commit, tag, or merge landed. |
+| `release` | A release or package version was published. |
+| `webhook` | An HTTP callback arrived — ours, or a vendor's. |
+| `http` | A direct request. |
+| `queue` | A message was enqueued. |
+| `poll` | The target checks the source on its own schedule. Set `maxLagSeconds` to at least one interval. |
+| `file` | An object appeared in a bucket, a file on disk, a row in a table. |
+| `deploy` | A deploy rolled it out. |
+| `manual` | A person did it. |
+| `other` | Say how in `label`. |
+
+`on: "change"` is for the trigger that runs often and fires its target only when
+something is new — the poller that runs every six hours and dispatches a build
+twice a month. `on: "failure"` draws the alerting and rollback paths, which are
+part of the system and fail too.
+
+**A node reference** is a node `id` in the same flow, `flow/node` for a node in
+another flow of the same business, or `business:flow/node` for a node another
+business reports. Flow and node ids are drawn from `[a-z0-9._-]` so the
+separators are unambiguous. Cross-flow edges are what join the flows into one
+map of the business. Cross-business edges are how a consumer polling several
+businesses draws one product that spans them — a solver that depends on a browser
+build another company ships — and the consumer resolves them only when it polls
+both; an unresolved one renders as a stub, never as an error.
+
+### Rules
+
+- **One flow per process a person would name.** "Firefox release to fleet",
+  "Customer top-up to credit", "Nightly ingest to search index". A flow with forty
+  nodes is three flows joined by references.
+- **The graph is the code's, not a diagram's.** Generate nodes and edges from what
+  actually defines them — the workflow files, the scheduler table, the queue
+  bindings — or keep them in one declaration next to the report assembler that a
+  test checks against those definitions. A hand-drawn graph is wrong the first
+  time somebody adds a cron, and wrong in the way that matters: the new step is
+  the one that is missing.
+- **A change that adds, removes, or rewires a trigger updates the flow in the
+  same pull request.** It is part of the change, the way a migration is.
+- **Status is observed, not assumed.** A node with no way to see its last run is
+  `unknown`, which is honest and draws attention. A node defaulted to `ok` is the
+  silent gap §2 exists to prevent.
+- **Report what happened on the node, and let the edges speak.** The producer
+  sets each node's `status`, including `stalled`. The consumer may also derive a
+  stalled edge on its own from `maxLagSeconds` and the two nodes' runs — the same
+  arithmetic, done where the drawing happens.
+- **`message` is written for a human** (§27). A failed step's message is the one
+  line an on-call reader needs — which check, which site, which version — never
+  a stack trace and never a log tail.
+
+---
+
+## 33. `runs` — stream: each time a step ran
+
+A stream of node executions. Where `flows` says what each node did last, `runs`
+says what every node did in order, and which run caused which. Only items whose
+`updatedAt` is after the `runs` cursor.
+
+```jsonc
+{
+  "id": "gh-8830",                  // REQUIRED. stable, unique within the business
+  "flow": "firefox-release",        // REQUIRED. flows[].id
+  "node": "lease-check",            // REQUIRED. nodes[].id in that flow
+  "status": "failure",              // REQUIRED. running | success | failure | partial
+                                    // | timeout | killed | skipped | cancelled
+  "startedAt": "2026-08-26T13:41:00.000Z",  // REQUIRED
+  "finishedAt": "2026-08-26T14:02:13.000Z", // null while running
+  "updatedAt": "2026-08-26T14:02:13.000Z",  // REQUIRED. ordering field
+  "trace": "ff-147.0.1",            // shared by every run one triggering cause produced
+  "cause": "gh-8822",               // runs[].id that started this one; null for a trigger
+  "version": "147.0.1",             // what this run worked on or produced
+  "message": "Canvas hash differs from reference on 3 of 40 sites",
+  "url": "https://github.com/acme/autoupdate/actions/runs/8830"
+}
+```
+
+**`trace` is the thread through a chain.** The trigger that starts it mints one
+— the release it found, the payment id, the run id — and every run it causes
+carries it forward: in the dispatch payload, the queue message, the build
+environment, the manifest the next step reads. Every node the chain reached then
+shares it, and the first node it never reached is where the chain stopped. That
+is the question an outage starts with, and with a trace the consumer answers it
+by lighting up one path across the graph. Without one, every run is an isolated
+fact and a person reconstructs the chain from timestamps.
+
+`cause` is the run that directly started this one, where that is known. It is
+what draws the arrow when two traces cross — the batch that started because two
+upstream releases landed in the same hour.
+
+### Rules
+
+- **Upsert on `id`, like `errors` and `issues`.** A run is emitted when it
+  starts and again when it finishes, each time with a later `updatedAt`. The pair
+  `(id, updatedAt)` separates a duplicate from an update (§2, rule 3). A run that
+  is still `running` returns each poll only if it changed.
+- **Not every execution of a frequent trigger.** A poller that runs every minute
+  and finds nothing is one `idle` node in `flows`, not 1,440 runs a day. Emit a
+  run when a node does work: `on: "change"` fired, a build started, a message
+  was consumed into a step that matters. Per-request work is §15, not this.
+- **A failed run is also a reason for an `event`** (§18) when a person should
+  hear about it, with `kind: "job"` and the run's `url`. The run is the record;
+  the event is the notification.
+- **Where a run comes from is not this document's business.** CI run history read
+  from the provider's API, rows the steps write to the business's own table, a
+  log the report assembler parses — all legitimate. What every source has to
+  carry is `trace`, and the only way to have it is to pass it along when one step
+  starts the next.
 
 ---
 
@@ -2217,8 +2522,10 @@ vendor. The LLM account also runs dry this week and does not appear as a risk,
 because it tops itself up. And since the 17:31 deploy, the database is serving
 three times the reads per request against a flat row count — the shape of an
 index that stopped being used. The retraining pipeline has been down two days on
-the same full disk, and the report still reads `warn`, because it is `internal`
-and no customer is waiting on it.
+the same full disk — its flow shows the chain stopping at `train`, with the gate
+and the model waiting behind it and inference still serving the 4 August model —
+and the report still reads `warn`, because it is `internal` and no customer is
+waiting on it.
 
 ```json
 {
@@ -2232,7 +2539,8 @@ and no customer is waiting on it.
       "errors": "2026-08-26T18:03:59.417Z",
       "inbox":  "2026-08-26T18:03:57.001Z",
       "issues": "2026-08-26T18:03:52.660Z",
-      "ci":     "2026-08-26T18:03:59.980Z"
+      "ci":     "2026-08-26T18:03:59.980Z",
+      "runs":   "2026-08-26T18:03:59.204Z"
     },
     "complete": true
   },
@@ -2752,6 +3060,46 @@ and no customer is waiting on it.
       "previous": { "sha": "88c1d0aa", "version": "0.6.0", "deployedAt": "2026-08-15T08:30:00.000Z" } }
   ],
 
+  "flows": [
+    { "id": "retrain", "name": "Nightly retrain → served model", "audience": "internal",
+      "critical": false, "status": "failed",
+      "summary": "Training has died on the full disk on gpu-01 twice; inference still serves ranker v1.1 from 4 Aug.",
+      "repos": ["acme/ranker"],
+      "nodes": [
+        { "id": "nightly", "name": "Nightly retrain schedule", "kind": "trigger",
+          "repo": "acme/ranker", "path": "deploy/retrain.timer", "schedule": "0 22 * * *",
+          "host": "gpu-01", "status": "ok", "staleAfterSeconds": 93600,
+          "lastRun": { "id": "retrain-sched-2026-08-25", "startedAt": "2026-08-25T22:00:00.000Z",
+                       "finishedAt": "2026-08-25T22:00:01.000Z", "outcome": "success",
+                       "trace": "retrain-2026-08-25" },
+          "lastSuccessAt": "2026-08-25T22:00:01.000Z" },
+        { "id": "train", "name": "Train on the last 30 days", "kind": "step",
+          "repo": "acme/ranker", "path": "train/run.py", "host": "gpu-01", "service": "retrain",
+          "status": "failed", "consecutiveFailures": 2,
+          "lastRun": { "id": "retrain-train-2026-08-26-manual", "startedAt": "2026-08-26T17:40:00.000Z",
+                       "finishedAt": "2026-08-26T17:52:10.000Z", "outcome": "failure",
+                       "trace": "retrain-2026-08-26-manual",
+                       "message": "No space left on device writing checkpoint 3 of 8" },
+          "lastSuccessAt": "2026-08-03T23:41:00.000Z" },
+        { "id": "evaluate", "name": "Holdout accuracy gate", "kind": "gate",
+          "repo": "acme/ranker", "path": "train/evaluate.py", "status": "waiting" },
+        { "id": "model", "name": "Model in the bucket", "kind": "artifact",
+          "repo": "acme/ranker", "status": "waiting",
+          "current": { "label": "Published", "value": "ranker v1.1", "at": "2026-08-04T00:12:00.000Z" } },
+        { "id": "serve", "name": "Inference serving", "kind": "service", "service": "inference",
+          "repo": "acme/api", "status": "ok",
+          "current": { "label": "Serving", "value": "ranker v1.1", "at": "2026-08-04T00:20:00.000Z" },
+          "follows": "model", "driftAfterSeconds": 3600 }
+      ],
+      "edges": [
+        { "from": "nightly",  "to": "train",    "via": "cron", "maxLagSeconds": 300 },
+        { "from": "train",    "to": "evaluate", "via": "workflow" },
+        { "from": "evaluate", "to": "model",    "via": "workflow", "on": "success" },
+        { "from": "model",    "to": "serve",    "via": "poll",
+          "label": "inference checks the bucket manifest every 10 min", "maxLagSeconds": 1200 }
+      ] }
+  ],
+
   "events": [
     { "id": "evt-2026-08-26-a1f2", "at": "2026-08-26T17:12:04.000Z", "kind": "vendor", "severity": "warn",
       "title": "Proxy balance projected to run out in 3 days",
@@ -2822,6 +3170,14 @@ and no customer is waiting on it.
       "failedJobs": ["test (node 22)"],
       "failedTests": ["applies coupons before tax", "rejects expired tokens"],
       "url": "https://github.com/acme/api/actions/runs/1892", "blocking": true }
+  ],
+
+  "runs": [
+    { "id": "retrain-train-2026-08-26-manual", "flow": "retrain", "node": "train",
+      "status": "failure", "startedAt": "2026-08-26T17:40:00.000Z",
+      "finishedAt": "2026-08-26T17:52:10.000Z", "updatedAt": "2026-08-26T17:52:10.000Z",
+      "trace": "retrain-2026-08-26-manual", "cause": null,
+      "message": "No space left on device writing checkpoint 3 of 8" }
   ],
 
   "incidents": [
